@@ -73,7 +73,7 @@ def resample_linear(x, orig_sr, target_sr):
 def build_swear_pattern(root_words):
     escaped_roots = [re.escape(r) for r in root_words if r.strip()]
     if not escaped_roots:
-        return re.compile(r"(?!x)x")  # никогда не совпадёт, если список пуст
+        return re.compile(r"(?!x)x")
     return re.compile(
         "^(?:" + "|".join(PREFIXES) + ")(?:" + "|".join(escaped_roots) + r")\w*$",
         re.IGNORECASE,
