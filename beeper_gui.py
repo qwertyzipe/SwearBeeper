@@ -2,8 +2,10 @@ import os
 import re
 import sys
 import json
+import wave
 import queue
 import threading
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -11,9 +13,33 @@ import numpy as np
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
 
-PLAYBACK_RATE = 48000   # частота для захвата/вывода звука (полное качество для человека)
-REC_RATE = 16000        # частота, которую требует Vosk для распознавания
+PLAYBACK_RATE = 48000
+REC_RATE = 16000
 BEEP_FREQ = 1000
+
+DEFAULT_ROOT_CORES = [
+    "бля",
+    "хуй",
+    "хуе",
+    "пизд",
+    "еб",
+    "ебан",
+    "сук",
+    "гандон",
+    "мудак",
+]
+
+PREFIXES = ["", "по", "на", "рас", "раз", "разъ", "за", "вы", "от", "отъ", "у", "пере", "под", "подъ", "до", "при", "об", "объ", "недо", "съ"]
+
+VB_CABLE_URL = "https://vb-audio.com/Cable/"
+
+
+def resource_path(relative_path):
+    if hasattr(sys, "_MEIPASS"):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
 
 
 def resample_linear(x, orig_sr, target_sr):
@@ -26,48 +52,33 @@ def resample_linear(x, orig_sr, target_sr):
     return np.interp(target_idx, orig_idx, x).astype(np.float32)
 
 
-def resource_path(relative_path):
-    if hasattr(sys, "_MEIPASS"):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
+def build_swear_pattern(root_words):
+    escaped_roots = [re.escape(r) for r in root_words if r.strip()]
+    if not escaped_roots:
+        return re.compile(r"(?!x)x")  # никогда не совпадёт, если список пуст
+    return re.compile(
+        "^(?:" + "|".join(PREFIXES) + ")(?:" + "|".join(escaped_roots) + r")\w*$",
+        re.IGNORECASE,
+    )
 
-ROOT_CORES = [
-    "бля",
-    "хуй",
-    "хуе",
-    "пизд",
-    "еб",
-    "ебан",
-    "сук",
-    "гандон",
-    "мудак",
-    "пидор",
-    "хуесос",
-    "писька",
-    "еблан",
-    "долбаёб",
-    "уёбак",
-    "уебак",
-    "шлюха",
-    "хуйня",
-    "блядина",
-    "сучка",
-    "сус",
-    "голохуевка",
-    "ахуй",
-    "дохуя",
-    "выблядок",
-    "негр",
-]
 
-PREFIXES = ["", "по", "на", "рас", "раз", "разъ", "за", "вы", "от", "отъ", "у", "пере", "под", "подъ", "до", "при", "об", "объ", "недо", "съ"]
+def load_wav_mono_float(path, target_sr):
+    with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
 
-SWEAR_PATTERN = re.compile(
-    "^(?:" + "|".join(PREFIXES) + ")(?:" + "|".join(ROOT_CORES) + r")\w*$",
-    re.IGNORECASE,
-)
+    if sampwidth != 2:
+        raise ValueError("Поддерживаются только 16-bit PCM WAV файлы")
+
+    data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if n_channels > 1:
+        data = data.reshape(-1, n_channels).mean(axis=1)
+    if framerate != target_sr:
+        data = resample_linear(data, framerate, target_sr)
+    return data.astype(np.float32)
 
 
 class DelayBuffer:
@@ -114,7 +125,7 @@ class DelayBuffer:
             self.read_pos += n
             return out
 
-    def stamp_beep(self, global_start_sample, global_end_sample, beep_volume):
+    def stamp_beep(self, global_start_sample, global_end_sample, segment_fn):
         with self.lock:
             if global_end_sample <= self.read_pos:
                 return False
@@ -124,10 +135,10 @@ class DelayBuffer:
             if end <= start:
                 return False
 
-            n = end - start
-            t = (np.arange(n) + start) / self.sr
-            beep = beep_volume * np.sin(2 * np.pi * BEEP_FREQ * t).astype(np.float32)
+            positions = np.arange(start, end)
+            beep = segment_fn(positions).astype(np.float32)
 
+            n = end - start
             offset_from_read = start - self.read_pos
             idx = (self._r + offset_from_read) % self.capacity
             end_idx = idx + n
@@ -152,15 +163,30 @@ class SwearBeeperEngine:
         self.rec_thread = None
         self.input_stream = None
         self.output_stream = None
+        self.custom_beep = None
+        self._partial_processed_count = 0
 
     def start(self):
         self.log("Загружаю модель Vosk...")
         self.model = Model(self.config["model_path"])
         self.recognizer = KaldiRecognizer(self.model, REC_RATE)
         self.recognizer.SetWords(True)
+        if hasattr(self.recognizer, "SetPartialWords"):
+            self.recognizer.SetPartialWords(True)
+
+        if self.config.get("custom_beep_path"):
+            try:
+                self.custom_beep = load_wav_mono_float(self.config["custom_beep_path"], PLAYBACK_RATE)
+                self.log(f"Кастомный звук бипа загружен: {len(self.custom_beep)} сэмплов")
+            except Exception as e:
+                self.log(f"Не удалось загрузить кастомный звук: {e}. Использую стандартный тон.")
+                self.custom_beep = None
+        else:
+            self.custom_beep = None
 
         self.delay_buffer = DelayBuffer(PLAYBACK_RATE, self.config["delay_sec"])
         self.running = True
+        self._partial_processed_count = 0
 
         self.rec_thread = threading.Thread(target=self._recognition_loop, daemon=True)
         self.rec_thread.start()
@@ -195,6 +221,9 @@ class SwearBeeperEngine:
         if status:
             self.log(str(status))
         mono = indata[:, 0].copy()
+        gain = self.config.get("mic_gain", 1.0)
+        if gain != 1.0:
+            mono = np.clip(mono * gain, -1.0, 1.0).astype(np.float32)
         self.delay_buffer.write(mono)
         mono_16k = resample_linear(mono, PLAYBACK_RATE, REC_RATE)
         self.mic_queue.put(mono_16k)
@@ -217,22 +246,47 @@ class SwearBeeperEngine:
 
             if self.recognizer.AcceptWaveform(pcm16):
                 result = json.loads(self.recognizer.Result())
+                words = result.get("result", [])
+                new_words = words[self._partial_processed_count:]
+                self._process_words(new_words)
                 text = result.get("text", "")
                 if text:
                     self.log(f"[РАСПОЗНАНО] {text}")
-                self._process_words(result.get("result", []))
+                self._partial_processed_count = 0
             else:
-                json.loads(self.recognizer.PartialResult())
+                partial = json.loads(self.recognizer.PartialResult())
+                words = partial.get("result", [])
+                if len(words) > self._partial_processed_count:
+                    new_words = words[self._partial_processed_count:]
+                    self._process_words(new_words)
+                    self._partial_processed_count = len(words)
+
+    def _beep_segment_sine(self, positions):
+        t = positions / PLAYBACK_RATE
+        volume = self.config.get("beep_volume", 0.12)
+        return volume * np.sin(2 * np.pi * BEEP_FREQ * t)
+
+    def _beep_segment_custom(self, positions, original_start):
+        idx = (positions - original_start) % len(self.custom_beep)
+        volume = self.config.get("beep_volume", 0.12)
+        return self.custom_beep[idx] * (volume / 0.12)
 
     def _process_words(self, words):
+        pattern = self.config["swear_pattern"]
         for w in words:
             word = w.get("word", "")
             word_normalized = word.replace("ё", "е").replace("Ё", "Е")
-            if SWEAR_PATTERN.match(word_normalized):
+            if pattern.match(word_normalized):
                 start_sample = int((w["start"] - self.config["pad_before"]) * PLAYBACK_RATE)
                 end_sample = int((w["end"] + self.config["pad_after"]) * PLAYBACK_RATE)
                 start_sample = max(0, start_sample)
-                ok = self.delay_buffer.stamp_beep(start_sample, end_sample, self.config["beep_volume"])
+
+                if self.custom_beep is not None:
+                    seg_fn = lambda positions, os_=start_sample: self._beep_segment_custom(positions, os_)
+                else:
+                    seg_fn = self._beep_segment_sine
+
+                ok = self.delay_buffer.stamp_beep(start_sample, end_sample, seg_fn)
                 tag = "OK" if ok else "ПОЗДНО"
                 self.log(f"[МАТ] '{word}' [{w['start']:.2f}s - {w['end']:.2f}s] -> бип: {tag}")
 
@@ -241,9 +295,11 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Swear Beeper")
-        self.root.geometry("560x520")
+        self.root.geometry("620x700")
         self.engine = None
         self.log_queue = queue.Queue()
+        self.root_words = list(DEFAULT_ROOT_CORES)
+        self.custom_beep_path_var = tk.StringVar(value="")
 
         self.devices = sd.query_devices()
 
@@ -252,8 +308,16 @@ class App:
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True)
 
-        frame = ttk.Frame(self.root)
+        main_tab = ttk.Frame(notebook)
+        words_tab = ttk.Frame(notebook)
+        notebook.add(main_tab, text="Основное")
+        notebook.add(words_tab, text="Запрещённые слова")
+
+        # ---------- Основная вкладка ----------
+        frame = ttk.Frame(main_tab)
         frame.pack(fill="x", **pad)
 
         ttk.Label(frame, text="Модель Vosk (папка):").grid(row=0, column=0, sticky="w")
@@ -271,11 +335,12 @@ class App:
         self.output_combo = ttk.Combobox(frame, textvariable=self.output_device_var, state="readonly", width=45)
         self.output_combo.grid(row=2, column=1, columnspan=2, sticky="we")
 
-        ttk.Button(frame, text="Обновить список устройств", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 8))
+        ttk.Button(frame, text="Обновить список устройств", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
+        ttk.Button(frame, text="Скачать VB-CABLE (для Discord)", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
 
-        ttk.Separator(self.root, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
-        sliders = ttk.Frame(self.root)
+        sliders = ttk.Frame(main_tab)
         sliders.pack(fill="x", **pad)
 
         self.delay_var = tk.DoubleVar(value=1.5)
@@ -290,20 +355,64 @@ class App:
         self.pad_after_var = tk.DoubleVar(value=0.12)
         self._add_slider(sliders, 3, "Паддинг ПОСЛЕ слова (сек):", self.pad_after_var, 0.0, 0.5)
 
-        ttk.Separator(self.root, orient="horizontal").pack(fill="x", pady=6)
+        self.mic_gain_var = tk.DoubleVar(value=1.0)
+        self._add_slider(sliders, 4, "Усиление микрофона (x):", self.mic_gain_var, 0.5, 5.0)
 
-        btn_frame = ttk.Frame(self.root)
+        ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
+
+        beep_sound_frame = ttk.Frame(main_tab)
+        beep_sound_frame.pack(fill="x", **pad)
+        ttk.Label(beep_sound_frame, text="Кастомный звук бипа (.wav):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(beep_sound_frame, textvariable=self.custom_beep_path_var, width=35, state="readonly").grid(row=0, column=1, sticky="we")
+        ttk.Button(beep_sound_frame, text="Обзор...", command=self._browse_beep_sound).grid(row=0, column=2)
+        ttk.Button(beep_sound_frame, text="Сбросить (стандартный тон)", command=self._reset_beep_sound).grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
+
+        btn_frame = ttk.Frame(main_tab)
         btn_frame.pack(fill="x", **pad)
         self.start_btn = ttk.Button(btn_frame, text="Старт", command=self._on_start)
         self.start_btn.pack(side="left", padx=4)
         self.stop_btn = ttk.Button(btn_frame, text="Стоп", command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=4)
 
-        log_frame = ttk.Frame(self.root)
+        log_frame = ttk.Frame(main_tab)
         log_frame.pack(fill="both", expand=True, **pad)
         ttk.Label(log_frame, text="Лог:").pack(anchor="w")
-        self.log_text = tk.Text(log_frame, height=15, state="disabled")
+        self.log_text = tk.Text(log_frame, height=12, state="disabled")
         self.log_text.pack(fill="both", expand=True)
+
+        # ---------- Вкладка со словами ----------
+        words_frame = ttk.Frame(words_tab)
+        words_frame.pack(fill="both", expand=True, **pad)
+
+        ttk.Label(words_frame, text="Список слов/корней, которые нужно запикивать:").pack(anchor="w")
+
+        list_container = ttk.Frame(words_frame)
+        list_container.pack(fill="both", expand=True, pady=4)
+
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical")
+        self.words_listbox = tk.Listbox(list_container, yscrollcommand=scrollbar.set, height=12)
+        scrollbar.config(command=self.words_listbox.yview)
+        self.words_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for w in self.root_words:
+            self.words_listbox.insert("end", w)
+
+        add_frame = ttk.Frame(words_frame)
+        add_frame.pack(fill="x", pady=6)
+        self.new_word_var = tk.StringVar()
+        ttk.Entry(add_frame, textvariable=self.new_word_var, width=30).pack(side="left", padx=4)
+        ttk.Button(add_frame, text="Добавить", command=self._add_word).pack(side="left", padx=4)
+        ttk.Button(add_frame, text="Удалить выбранное", command=self._remove_word).pack(side="left", padx=4)
+
+        ttk.Label(
+            words_frame,
+            text="Подсказка: вводи корень слова без окончания (например 'хуй', а не 'хуйня') —\n"
+                 "приложение само учитывает типичные приставки и окончания.",
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
 
         self._refresh_devices()
 
@@ -313,16 +422,44 @@ class App:
         scale.grid(row=row, column=1, sticky="we", padx=6)
         value_label = ttk.Label(parent, text=f"{var.get():.2f}")
         value_label.grid(row=row, column=2, sticky="w")
-
-        def update_label(_event=None, v=var, l=value_label):
-            l.config(text=f"{v.get():.2f}")
-
         scale.config(command=lambda _v, v=var, l=value_label: l.config(text=f"{v.get():.2f}"))
 
     def _browse_model(self):
         path = filedialog.askdirectory(title="Выбери папку модели Vosk")
         if path:
             self.model_path_var.set(path)
+
+    def _browse_beep_sound(self):
+        path = filedialog.askopenfilename(title="Выбери .wav файл для бипа", filetypes=[("WAV files", "*.wav")])
+        if path:
+            self.custom_beep_path_var.set(path)
+
+    def _reset_beep_sound(self):
+        self.custom_beep_path_var.set("")
+
+    def _open_vbcable(self):
+        webbrowser.open(VB_CABLE_URL)
+
+    def _add_word(self):
+        word = self.new_word_var.get().strip().lower()
+        if not word:
+            return
+        if word in self.root_words:
+            messagebox.showinfo("Инфо", "Это слово уже есть в списке.")
+            return
+        self.root_words.append(word)
+        self.words_listbox.insert("end", word)
+        self.new_word_var.set("")
+
+    def _remove_word(self):
+        selection = self.words_listbox.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        word = self.words_listbox.get(index)
+        self.words_listbox.delete(index)
+        if word in self.root_words:
+            self.root_words.remove(word)
 
     def _refresh_devices(self):
         self.devices = sd.query_devices()
@@ -367,6 +504,10 @@ class App:
             messagebox.showerror("Ошибка", f"Папка модели не найдена: {model_path}")
             return
 
+        if not self.root_words:
+            messagebox.showerror("Ошибка", "Список запрещённых слов пуст — добавь хотя бы одно слово.")
+            return
+
         config = {
             "model_path": model_path,
             "input_device": self._parse_device_index(self.input_device_var.get()),
@@ -375,6 +516,9 @@ class App:
             "beep_volume": self.beep_volume_var.get(),
             "pad_before": self.pad_before_var.get(),
             "pad_after": self.pad_after_var.get(),
+            "mic_gain": self.mic_gain_var.get(),
+            "custom_beep_path": self.custom_beep_path_var.get() or None,
+            "swear_pattern": build_swear_pattern(self.root_words),
             "block_ms": 50,
         }
 
