@@ -17,7 +17,7 @@ PLAYBACK_RATE = 48000
 REC_RATE = 16000
 BEEP_FREQ = 1000
 
-ROOT_CORES = [
+DEFAULT_ROOT_CORES = [
     "бля",
     "хуй",
     "хуе",
@@ -31,25 +31,29 @@ ROOT_CORES = [
     "хуесос",
     "писька",
     "еблан",
-    "долбаёб",
-    "уёбак",
+    "долбаеб",
     "уебак",
     "шлюха",
     "хуйня",
     "блядина",
     "сучка",
-    "сус",
     "голохуевка",
     "ахуй",
     "дохуя",
     "выблядок",
     "негр",
-    "",
 ]
 
 PREFIXES = ["", "по", "на", "рас", "раз", "разъ", "за", "вы", "от", "отъ", "у", "пере", "под", "подъ", "до", "при", "об", "объ", "недо", "съ"]
 
 VB_CABLE_URL = "https://vb-audio.com/Cable/"
+SETTINGS_FILENAME = "swear_beeper_settings.json"
+
+DEFAULT_DELAY = 1.5
+DEFAULT_BEEP_VOLUME = 0.12
+DEFAULT_PAD_BEFORE = -0.12
+DEFAULT_PAD_AFTER = 0.12
+DEFAULT_MIC_GAIN = 1.0
 
 
 def resource_path(relative_path):
@@ -58,6 +62,34 @@ def resource_path(relative_path):
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
+
+
+def settings_path():
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, SETTINGS_FILENAME)
+
+
+def load_settings():
+    path = settings_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_settings(data):
+    path = settings_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def resample_linear(x, orig_sr, target_sr):
@@ -313,16 +345,22 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Swear Beeper")
-        self.root.geometry("620x700")
+        self.root.geometry("620x740")
         self.engine = None
         self.log_queue = queue.Queue()
-        self.root_words = list(DEFAULT_ROOT_CORES)
-        self.custom_beep_path_var = tk.StringVar(value="")
+
+        self.saved = load_settings()
+        self.root_words = list(self.saved.get("root_words", DEFAULT_ROOT_CORES))
+        self.custom_beep_path_var = tk.StringVar(value=self.saved.get("custom_beep_path", "") or "")
 
         self.devices = sd.query_devices()
 
+        self._suppress_autosave = True
         self._build_ui()
+        self._suppress_autosave = False
+
         self._poll_log_queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
@@ -339,7 +377,9 @@ class App:
         frame.pack(fill="x", **pad)
 
         ttk.Label(frame, text="Модель Vosk (папка):").grid(row=0, column=0, sticky="w")
-        self.model_path_var = tk.StringVar(value=resource_path("model_ru"))
+        default_model_path = self.saved.get("model_path") or resource_path("model_ru")
+        self.model_path_var = tk.StringVar(value=default_model_path)
+        self.model_path_var.trace_add("write", self._autosave)
         ttk.Entry(frame, textvariable=self.model_path_var, width=35).grid(row=0, column=1, sticky="we")
         ttk.Button(frame, text="Обзор...", command=self._browse_model).grid(row=0, column=2)
 
@@ -347,11 +387,13 @@ class App:
         self.input_device_var = tk.StringVar()
         self.input_combo = ttk.Combobox(frame, textvariable=self.input_device_var, state="readonly", width=45)
         self.input_combo.grid(row=1, column=1, columnspan=2, sticky="we")
+        self.input_combo.bind("<<ComboboxSelected>>", lambda e: self._autosave())
 
         ttk.Label(frame, text="Выход (динамики / кабель):").grid(row=2, column=0, sticky="w")
         self.output_device_var = tk.StringVar()
         self.output_combo = ttk.Combobox(frame, textvariable=self.output_device_var, state="readonly", width=45)
         self.output_combo.grid(row=2, column=1, columnspan=2, sticky="we")
+        self.output_combo.bind("<<ComboboxSelected>>", lambda e: self._autosave())
 
         ttk.Button(frame, text="Обновить список устройств", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
         ttk.Button(frame, text="Скачать VB-CABLE (для Discord)", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
@@ -361,20 +403,20 @@ class App:
         sliders = ttk.Frame(main_tab)
         sliders.pack(fill="x", **pad)
 
-        self.delay_var = tk.DoubleVar(value=1.5)
-        self._add_slider(sliders, 0, "Задержка (сек):", self.delay_var, 0.3, 4.0)
+        self.delay_var = tk.DoubleVar(value=self.saved.get("delay", DEFAULT_DELAY))
+        self._add_slider(sliders, 0, "Задержка (сек):", self.delay_var, 0.3, 4.0, DEFAULT_DELAY)
 
-        self.beep_volume_var = tk.DoubleVar(value=0.12)
-        self._add_slider(sliders, 1, "Громкость бипа:", self.beep_volume_var, 0.0, 1.0)
+        self.beep_volume_var = tk.DoubleVar(value=self.saved.get("beep_volume", DEFAULT_BEEP_VOLUME))
+        self._add_slider(sliders, 1, "Громкость бипа:", self.beep_volume_var, 0.0, 1.0, DEFAULT_BEEP_VOLUME)
 
-        self.pad_before_var = tk.DoubleVar(value=-0.12)
-        self._add_slider(sliders, 2, "Паддинг ДО слова (сек):", self.pad_before_var, -0.3, 0.3)
+        self.pad_before_var = tk.DoubleVar(value=self.saved.get("pad_before", DEFAULT_PAD_BEFORE))
+        self._add_slider(sliders, 2, "Паддинг ДО слова (сек):", self.pad_before_var, -0.3, 0.3, DEFAULT_PAD_BEFORE)
 
-        self.pad_after_var = tk.DoubleVar(value=0.12)
-        self._add_slider(sliders, 3, "Паддинг ПОСЛЕ слова (сек):", self.pad_after_var, 0.0, 0.5)
+        self.pad_after_var = tk.DoubleVar(value=self.saved.get("pad_after", DEFAULT_PAD_AFTER))
+        self._add_slider(sliders, 3, "Паддинг ПОСЛЕ слова (сек):", self.pad_after_var, 0.0, 0.5, DEFAULT_PAD_AFTER)
 
-        self.mic_gain_var = tk.DoubleVar(value=1.0)
-        self._add_slider(sliders, 4, "Усиление микрофона (x):", self.mic_gain_var, 0.5, 5.0)
+        self.mic_gain_var = tk.DoubleVar(value=self.saved.get("mic_gain", DEFAULT_MIC_GAIN))
+        self._add_slider(sliders, 4, "Усиление микрофона (x):", self.mic_gain_var, 0.5, 5.0, DEFAULT_MIC_GAIN)
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -397,7 +439,7 @@ class App:
         log_frame = ttk.Frame(main_tab)
         log_frame.pack(fill="both", expand=True, **pad)
         ttk.Label(log_frame, text="Лог:").pack(anchor="w")
-        self.log_text = tk.Text(log_frame, height=12, state="disabled")
+        self.log_text = tk.Text(log_frame, height=10, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
         # ---------- Вкладка со словами ----------
@@ -433,14 +475,28 @@ class App:
         ).pack(anchor="w", pady=(6, 0))
 
         self._refresh_devices()
+        self._restore_device_selection()
 
-    def _add_slider(self, parent, row, label, var, frm, to):
+    def _add_slider(self, parent, row, label, var, frm, to, default_value):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
-        scale = ttk.Scale(parent, from_=frm, to=to, variable=var, orient="horizontal", length=250)
+        scale = ttk.Scale(parent, from_=frm, to=to, variable=var, orient="horizontal", length=230)
         scale.grid(row=row, column=1, sticky="we", padx=6)
-        value_label = ttk.Label(parent, text=f"{var.get():.2f}")
+        value_label = ttk.Label(parent, text=f"{var.get():.2f}", width=6)
         value_label.grid(row=row, column=2, sticky="w")
-        scale.config(command=lambda _v, v=var, l=value_label: l.config(text=f"{v.get():.2f}"))
+
+        def on_change(_v, v=var, l=value_label):
+            l.config(text=f"{v.get():.2f}")
+            self._autosave()
+
+        scale.config(command=on_change)
+
+        def reset(v=var, l=value_label, d=default_value):
+            v.set(d)
+            l.config(text=f"{d:.2f}")
+            self._autosave()
+
+        reset_btn = ttk.Button(parent, text="↺", width=3, command=reset)
+        reset_btn.grid(row=row, column=3, sticky="w", padx=(4, 0))
 
     def _browse_model(self):
         path = filedialog.askdirectory(title="Выбери папку модели Vosk")
@@ -451,9 +507,11 @@ class App:
         path = filedialog.askopenfilename(title="Выбери .wav файл для бипа", filetypes=[("WAV files", "*.wav")])
         if path:
             self.custom_beep_path_var.set(path)
+            self._autosave()
 
     def _reset_beep_sound(self):
         self.custom_beep_path_var.set("")
+        self._autosave()
 
     def _open_vbcable(self):
         webbrowser.open(VB_CABLE_URL)
@@ -468,6 +526,7 @@ class App:
         self.root_words.append(word)
         self.words_listbox.insert("end", word)
         self.new_word_var.set("")
+        self._autosave()
 
     def _remove_word(self):
         selection = self.words_listbox.curselection()
@@ -478,6 +537,7 @@ class App:
         self.words_listbox.delete(index)
         if word in self.root_words:
             self.root_words.remove(word)
+        self._autosave()
 
     def _refresh_devices(self):
         self.devices = sd.query_devices()
@@ -497,8 +557,29 @@ class App:
         if output_options and not self.output_device_var.get():
             self.output_combo.current(0)
 
+    def _restore_device_selection(self):
+        saved_input_name = self.saved.get("input_device_name")
+        saved_output_name = self.saved.get("output_device_name")
+
+        if saved_input_name:
+            for item in self.input_combo["values"]:
+                name = item.split(":", 1)[1].strip() if ":" in item else item
+                if name == saved_input_name:
+                    self.input_device_var.set(item)
+                    break
+
+        if saved_output_name:
+            for item in self.output_combo["values"]:
+                name = item.split(":", 1)[1].strip() if ":" in item else item
+                if name == saved_output_name:
+                    self.output_device_var.set(item)
+                    break
+
     def _parse_device_index(self, combo_value):
         return int(combo_value.split(":")[0])
+
+    def _parse_device_name(self, combo_value):
+        return combo_value.split(":", 1)[1].strip() if ":" in combo_value else combo_value
 
     def _log(self, message):
         self.log_queue.put(message)
@@ -511,6 +592,29 @@ class App:
             self.log_text.see("end")
             self.log_text.config(state="disabled")
         self.root.after(100, self._poll_log_queue)
+
+    def _collect_settings(self):
+        return {
+            "delay": self.delay_var.get(),
+            "beep_volume": self.beep_volume_var.get(),
+            "pad_before": self.pad_before_var.get(),
+            "pad_after": self.pad_after_var.get(),
+            "mic_gain": self.mic_gain_var.get(),
+            "model_path": self.model_path_var.get(),
+            "custom_beep_path": self.custom_beep_path_var.get() or None,
+            "root_words": list(self.root_words),
+            "input_device_name": self._parse_device_name(self.input_device_var.get()) if self.input_device_var.get() else None,
+            "output_device_name": self._parse_device_name(self.output_device_var.get()) if self.output_device_var.get() else None,
+        }
+
+    def _autosave(self, *args):
+        if getattr(self, "_suppress_autosave", False):
+            return
+        save_settings(self._collect_settings())
+
+    def _on_close(self):
+        self._autosave()
+        self.root.destroy()
 
     def _on_start(self):
         if not self.input_device_var.get() or not self.output_device_var.get():
@@ -525,6 +629,8 @@ class App:
         if not self.root_words:
             messagebox.showerror("Ошибка", "Список запрещённых слов пуст — добавь хотя бы одно слово.")
             return
+
+        self._autosave()
 
         config = {
             "model_path": model_path,
