@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import random
 import json
 import wave
 import math
@@ -8,6 +9,7 @@ import queue
 import socket
 import threading
 import webbrowser
+import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -63,6 +65,50 @@ PREFIXES = ["", "по", "на", "рас", "раз", "разъ", "за", "вы", 
 
 VB_CABLE_URL = "https://vb-audio.com/Cable/"
 SETTINGS_FILENAME = "swear_beeper_settings.json"
+JOURNAL_FILENAME = "swear_beeper_journal.log"
+
+
+def journal_path():
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, JOURNAL_FILENAME)
+
+
+def append_journal_entry(word):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(journal_path(), "a", encoding="utf-8") as f:
+            f.write(f"{timestamp}\t{word}\n")
+    except Exception:
+        pass
+    return timestamp
+
+
+def load_journal():
+    path = journal_path()
+    entries = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if "\t" in line:
+                        ts, word = line.split("\t", 1)
+                        entries.append((ts, word))
+        except Exception:
+            pass
+    return entries
+
+
+def clear_journal_file():
+    path = journal_path()
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 DEFAULT_DELAY = 1.5
 DEFAULT_BEEP_VOLUME = 0.12
@@ -252,60 +298,11 @@ class DelayBuffer:
             return True
 
 
-class MicTestEngine:
-
-    def __init__(self, input_device, output_device, level_callback):
-        self.input_device = input_device
-        self.output_device = output_device
-        self.level_callback = level_callback
-        self.buffer = DelayBuffer(PLAYBACK_RATE, 0.05)
-        self.running = False
-        self.input_stream = None
-        self.output_stream = None
-
-    def start(self):
-        self.running = True
-        blocksize = int(PLAYBACK_RATE * 0.05)
-        self.input_stream = sd.InputStream(
-            samplerate=PLAYBACK_RATE, channels=1, dtype="float32",
-            blocksize=blocksize, callback=self._in_cb,
-            device=self.input_device, latency="high",
-        )
-        self.output_stream = sd.OutputStream(
-            samplerate=PLAYBACK_RATE, channels=1, dtype="float32",
-            blocksize=blocksize, callback=self._out_cb,
-            device=self.output_device, latency="high",
-        )
-        self.input_stream.start()
-        self.output_stream.start()
-
-    def stop(self):
-        self.running = False
-        if self.input_stream:
-            self.input_stream.stop()
-            self.input_stream.close()
-        if self.output_stream:
-            self.output_stream.stop()
-            self.output_stream.close()
-
-    def _in_cb(self, indata, frames, time_info, status):
-        mono = indata[:, 0].copy()
-        self.buffer.write(mono)
-        level = float(np.sqrt(np.mean(mono ** 2))) if len(mono) else 0.0
-        self.level_callback(level)
-
-    def _out_cb(self, outdata, frames, time_info, status):
-        ready = self.buffer.read_ready()
-        if ready >= frames:
-            outdata[:, 0] = self.buffer.read(frames)
-        else:
-            outdata[:, 0] = 0
-
-
 class SwearBeeperEngine:
-    def __init__(self, config, log_callback):
+    def __init__(self, config, log_callback, journal_callback=None):
         self.config = config
         self.log = log_callback
+        self.journal_callback = journal_callback
         self.running = False
         self.model = None
         self.recognizer = None
@@ -314,7 +311,7 @@ class SwearBeeperEngine:
         self.rec_thread = None
         self.input_stream = None
         self.output_stream = None
-        self.custom_beep = None
+        self.custom_beeps = []
         self._partial_processed_count = 0
         self.level = 0.0
         self.manual_mute = False
@@ -328,15 +325,17 @@ class SwearBeeperEngine:
         if hasattr(self.recognizer, "SetPartialWords"):
             self.recognizer.SetPartialWords(True)
 
-        if self.config.get("custom_beep_path"):
+        self.custom_beeps = []
+        for path in self.config.get("custom_beep_paths", []) or []:
             try:
-                self.custom_beep = load_wav_mono_float(self.config["custom_beep_path"], PLAYBACK_RATE)
-                self.log(f"Кастомный звук бипа загружен: {len(self.custom_beep)} сэмплов")
+                data = load_wav_mono_float(path, PLAYBACK_RATE)
+                self.custom_beeps.append(data)
+                self.log(f"Звук загружен: {os.path.basename(path)} ({len(data)} сэмплов)")
             except Exception as e:
-                self.log(f"Не удалось загрузить кастомный звук: {e}. Использую стандартный тон.")
-                self.custom_beep = None
-        else:
-            self.custom_beep = None
+                self.log(f"Не удалось загрузить звук '{path}': {e}. Пропускаю.")
+
+        if not self.custom_beeps:
+            self.log("Кастомные звуки не заданы — использую стандартный тон.")
 
         self.delay_buffer = DelayBuffer(PLAYBACK_RATE, self.config["delay_sec"])
         self.running = True
@@ -425,10 +424,10 @@ class SwearBeeperEngine:
         volume = self.config.get("beep_volume", 0.12)
         return volume * np.sin(2 * np.pi * BEEP_FREQ * t)
 
-    def _beep_segment_custom(self, positions, original_start):
-        idx = (positions - original_start) % len(self.custom_beep)
+    def _beep_segment_custom(self, positions, original_start, sound_array):
+        idx = (positions - original_start) % len(sound_array)
         volume = self.config.get("beep_volume", 0.12)
-        return self.custom_beep[idx] * (volume / 0.12)
+        return sound_array[idx] * (volume / 0.12)
 
     def _process_words(self, words):
         pattern = self.config["swear_pattern"]
@@ -443,8 +442,9 @@ class SwearBeeperEngine:
                 end_sample = int((w["end"] + self.config["pad_after"]) * PLAYBACK_RATE)
                 start_sample = max(0, start_sample)
 
-                if self.custom_beep is not None:
-                    seg_fn = lambda positions, os_=start_sample: self._beep_segment_custom(positions, os_)
+                if self.custom_beeps:
+                    chosen_sound = random.choice(self.custom_beeps)
+                    seg_fn = lambda positions, os_=start_sample, snd=chosen_sound: self._beep_segment_custom(positions, os_, snd)
                 else:
                     seg_fn = self._beep_segment_sine
 
@@ -454,6 +454,8 @@ class SwearBeeperEngine:
                 if ok:
                     self.stats["total"] += 1
                     self.stats["per_word"][word_normalized] = self.stats["per_word"].get(word_normalized, 0) + 1
+                    if self.journal_callback:
+                        self.journal_callback(word_normalized)
 
 
 class App:
@@ -465,6 +467,8 @@ class App:
         self.engine = None
         self.mic_test_engine = None
         self.log_queue = queue.Queue()
+        self.journal_queue = queue.Queue()
+        self.journal_entries = load_journal()
         self.current_level = 0.0
         self.level_display = 0.0
         self.tray_icon = None
@@ -474,7 +478,7 @@ class App:
         self.saved = load_settings()
         self.root_words = list(self.saved.get("root_words", DEFAULT_ROOT_CORES))
         self.whitelist_words = list(self.saved.get("whitelist_words", []))
-        self.custom_beep_path_var = tk.StringVar(value=self.saved.get("custom_beep_path", "") or "")
+        self.custom_beep_paths = list(self.saved.get("custom_beep_paths", []) or [])
         self.alltime_stats = {
             "total": self.saved.get("alltime_total", 0),
             "per_word": dict(self.saved.get("alltime_per_word", {})),
@@ -506,13 +510,16 @@ class App:
         main_tab = ttk.Frame(notebook)
         words_tab = ttk.Frame(notebook)
         stats_tab = ttk.Frame(notebook)
+        journal_tab = ttk.Frame(notebook)
         notebook.add(main_tab, text="Основное")
         notebook.add(words_tab, text="Слова")
         notebook.add(stats_tab, text="Статистика")
+        notebook.add(journal_tab, text="Журнал")
 
         self._build_main_tab(main_tab, pad)
         self._build_words_tab(words_tab, pad)
         self._build_stats_tab(stats_tab, pad)
+        self._build_journal_tab(journal_tab, pad)
 
         self._refresh_devices()
         self._restore_device_selection()
@@ -527,6 +534,7 @@ class App:
         self.model_path_var.trace_add("write", self._autosave)
         ttk.Entry(frame, textvariable=self.model_path_var, width=35).grid(row=0, column=1, sticky="we")
         ttk.Button(frame, text="Обзор...", command=self._browse_model).grid(row=0, column=2)
+        ttk.Button(frame, text="Сбросить путь", command=self._reset_model_path).grid(row=0, column=3, padx=(4, 0))
 
         ttk.Label(frame, text="Микрофон (вход):").grid(row=1, column=0, sticky="w")
         self.input_device_var = tk.StringVar()
@@ -551,8 +559,13 @@ class App:
 
         test_frame = ttk.Frame(main_tab)
         test_frame.pack(fill="x", **pad)
-        self.mic_test_btn = ttk.Button(test_frame, text="Тест микрофона (прослушать себя)", command=self._toggle_mic_test)
-        self.mic_test_btn.pack(side="left")
+        ttk.Label(test_frame, text="Выход для теста (твои наушники/колонки, НЕ CABLE):").grid(row=0, column=0, sticky="w")
+        self.test_output_device_var = tk.StringVar()
+        self.test_output_combo = ttk.Combobox(test_frame, textvariable=self.test_output_device_var, state="readonly", width=42)
+        self.test_output_combo.grid(row=0, column=1, sticky="we", padx=(4, 0))
+        self.test_output_combo.bind("<<ComboboxSelected>>", lambda e: self._autosave())
+        self.mic_test_btn = ttk.Button(test_frame, text="Тест микрофона (с цензурой мата)", command=self._toggle_mic_test)
+        self.mic_test_btn.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -577,12 +590,25 @@ class App:
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
         beep_sound_frame = ttk.Frame(main_tab)
-        beep_sound_frame.pack(fill="x", **pad)
-        ttk.Label(beep_sound_frame, text="Кастомный звук бипа (.wav):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(beep_sound_frame, textvariable=self.custom_beep_path_var, width=30, state="readonly").grid(row=0, column=1, sticky="we")
-        ttk.Button(beep_sound_frame, text="Обзор...", command=self._browse_beep_sound).grid(row=0, column=2)
-        ttk.Button(beep_sound_frame, text="Прослушать", command=self._preview_beep_sound).grid(row=0, column=3, padx=(4, 0))
-        ttk.Button(beep_sound_frame, text="Сбросить (тон)", command=self._reset_beep_sound).grid(row=1, column=1, sticky="w", pady=(4, 0))
+        beep_sound_frame.pack(fill="both", **pad)
+        ttk.Label(beep_sound_frame, text="Звуки вместо бипа (.wav) — при мате выбирается случайный из списка:").pack(anchor="w")
+
+        beep_list_container = ttk.Frame(beep_sound_frame)
+        beep_list_container.pack(fill="x", pady=4)
+        beep_scrollbar = ttk.Scrollbar(beep_list_container, orient="vertical")
+        self.beep_sounds_listbox = tk.Listbox(beep_list_container, yscrollcommand=beep_scrollbar.set, height=4, selectmode="extended")
+        beep_scrollbar.config(command=self.beep_sounds_listbox.yview)
+        self.beep_sounds_listbox.pack(side="left", fill="x", expand=True)
+        beep_scrollbar.pack(side="right", fill="y")
+        for p in self.custom_beep_paths:
+            self.beep_sounds_listbox.insert("end", p)
+
+        beep_btn_row = ttk.Frame(beep_sound_frame)
+        beep_btn_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(beep_btn_row, text="Добавить звук(и)...", command=self._add_beep_sounds).pack(side="left", padx=(0, 4))
+        ttk.Button(beep_btn_row, text="Удалить выбранное", command=self._remove_beep_sound).pack(side="left", padx=(0, 4))
+        ttk.Button(beep_btn_row, text="Очистить (вернуть тон)", command=self._reset_beep_sound).pack(side="left", padx=(0, 4))
+        ttk.Button(beep_btn_row, text="Прослушать случайный", command=self._preview_beep_sound).pack(side="left")
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -678,14 +704,49 @@ class App:
         self.stats_alltime_label = ttk.Label(frame, text="Матов за всё время: 0", font=("", 13, "bold"))
         self.stats_alltime_label.pack(anchor="w", pady=(0, 8))
 
-        ttk.Label(frame, text="Разбивка по словам (сессия + всё время вместе):").pack(anchor="w")
-        self.stats_text = tk.Text(frame, height=15, state="disabled")
+        ttk.Label(frame, text="Таблица-рейтинг (кто чаще всего — тот выше):").pack(anchor="w")
+        self.stats_text = tk.Text(frame, height=15, state="disabled", font=("Consolas", 10))
         self.stats_text.pack(fill="both", expand=True, pady=4)
 
         btn_row = ttk.Frame(frame)
         btn_row.pack(anchor="w", pady=(6, 0))
         ttk.Button(btn_row, text="Сбросить статистику сессии", command=self._reset_session_stats).pack(side="left", padx=(0, 6))
         ttk.Button(btn_row, text="Сбросить статистику за всё время", command=self._reset_alltime_stats).pack(side="left")
+
+    def _build_journal_tab(self, journal_tab, pad):
+        frame = ttk.Frame(journal_tab)
+        frame.pack(fill="both", expand=True, **pad)
+
+        ttk.Label(frame, text="Журнал матов — хронологический список (что и когда было сказано):").pack(anchor="w")
+
+        text_container = ttk.Frame(frame)
+        text_container.pack(fill="both", expand=True, pady=4)
+        scrollbar = ttk.Scrollbar(text_container, orient="vertical")
+        self.journal_text = tk.Text(text_container, height=20, state="disabled", yscrollcommand=scrollbar.set, font=("Consolas", 10))
+        scrollbar.config(command=self.journal_text.yview)
+        self.journal_text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for ts, word in self.journal_entries:
+            self._append_journal_line(ts, word)
+
+        ttk.Button(frame, text="Очистить журнал", command=self._clear_journal).pack(anchor="w", pady=(6, 0))
+
+    def _append_journal_line(self, timestamp, word):
+        self.journal_text.config(state="normal")
+        self.journal_text.insert("end", f"{timestamp}\t{word}\n")
+        self.journal_text.see("end")
+        self.journal_text.config(state="disabled")
+
+    def _clear_journal(self):
+        if not messagebox.askyesno("Подтверждение", "Удалить весь журнал матов (всю историю)?"):
+            return
+        clear_journal_file()
+        self.journal_entries = []
+        self.journal_text.config(state="normal")
+        self.journal_text.delete("1.0", "end")
+        self.journal_text.config(state="disabled")
+        self._log("Журнал матов очищен.")
 
     def _add_slider(self, parent, row, label, var, frm, to, default_value):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
@@ -709,28 +770,49 @@ class App:
         reset_btn.grid(row=row, column=3, sticky="w", padx=(4, 0))
 
 
+    def _reset_model_path(self):
+        self.model_path_var.set(resource_path("model_ru"))
+        self._autosave()
+
     def _browse_model(self):
         path = filedialog.askdirectory(title="Выбери папку модели Vosk")
         if path:
             self.model_path_var.set(path)
 
-    def _browse_beep_sound(self):
-        path = filedialog.askopenfilename(title="Выбери .wav файл для бипа", filetypes=[("WAV files", "*.wav")])
-        if path:
-            self.custom_beep_path_var.set(path)
-            self._autosave()
+    def _add_beep_sounds(self):
+        paths = filedialog.askopenfilenames(title="Выбери .wav файл(ы) для замены бипа", filetypes=[("WAV files", "*.wav")])
+        if not paths:
+            return
+        for p in paths:
+            if p not in self.custom_beep_paths:
+                self.custom_beep_paths.append(p)
+                self.beep_sounds_listbox.insert("end", p)
+        self._autosave()
+
+    def _remove_beep_sound(self):
+        selection = self.beep_sounds_listbox.curselection()
+        if not selection:
+            return
+        for index in sorted(selection, reverse=True):
+            path = self.beep_sounds_listbox.get(index)
+            self.beep_sounds_listbox.delete(index)
+            if path in self.custom_beep_paths:
+                self.custom_beep_paths.remove(path)
+        self._autosave()
 
     def _reset_beep_sound(self):
-        self.custom_beep_path_var.set("")
+        self.beep_sounds_listbox.delete(0, "end")
+        self.custom_beep_paths.clear()
         self._autosave()
 
     def _preview_beep_sound(self):
         try:
-            out_val = self.output_device_var.get()
+            out_val = self.test_output_device_var.get() or self.output_device_var.get()
             device_idx = self._parse_device_index(out_val) if out_val else None
-            path = self.custom_beep_path_var.get()
-            if path:
+            if self.custom_beep_paths:
+                path = random.choice(self.custom_beep_paths)
                 data = load_wav_mono_float(path, PLAYBACK_RATE)
+                self._log(f"Превью случайного звука: {os.path.basename(path)}")
             else:
                 t = np.arange(int(PLAYBACK_RATE * 0.3)) / PLAYBACK_RATE
                 data = (self.beep_volume_var.get() * np.sin(2 * np.pi * BEEP_FREQ * t)).astype(np.float32)
@@ -754,14 +836,21 @@ class App:
 
         self.input_combo["values"] = input_options
         self.output_combo["values"] = output_options
+        self.test_output_combo["values"] = output_options
+
         if input_options and not self.input_device_var.get():
             self.input_combo.current(0)
         if output_options and not self.output_device_var.get():
             self.output_combo.current(0)
 
+        if output_options and not self.test_output_device_var.get():
+            non_cable = [o for o in output_options if "cable" not in o.lower()]
+            self.test_output_device_var.set(non_cable[0] if non_cable else output_options[0])
+
     def _restore_device_selection(self):
         saved_input_name = self.saved.get("input_device_name")
         saved_output_name = self.saved.get("output_device_name")
+        saved_test_output_name = self.saved.get("test_output_device_name")
 
         if saved_input_name:
             for item in self.input_combo["values"]:
@@ -775,6 +864,13 @@ class App:
                 name = item.split(":", 1)[1].strip() if ":" in item else item
                 if name == saved_output_name:
                     self.output_device_var.set(item)
+                    break
+
+        if saved_test_output_name:
+            for item in self.test_output_combo["values"]:
+                name = item.split(":", 1)[1].strip() if ":" in item else item
+                if name == saved_test_output_name:
+                    self.test_output_device_var.set(item)
                     break
 
     def _parse_device_index(self, combo_value):
@@ -958,7 +1054,7 @@ class App:
         if self.mic_test_engine and self.mic_test_engine.running:
             self.mic_test_engine.stop()
             self.mic_test_engine = None
-            self.mic_test_btn.config(text="Тест микрофона (прослушать себя)")
+            self.mic_test_btn.config(text="Тест микрофона (с цензурой мата)")
             self._log("Тест микрофона остановлен.")
             return
 
@@ -966,14 +1062,11 @@ class App:
             messagebox.showerror("Ошибка", "Сначала останови основной движок (кнопка Стоп).")
             return
 
-        if not self.input_device_var.get() or not self.output_device_var.get():
-            messagebox.showerror("Ошибка", "Выбери микрофон и устройство вывода.")
+        config = self._validate_and_build_config(override_output_device=self.test_output_device_var.get())
+        if config is None:
             return
 
-        in_idx = self._parse_device_index(self.input_device_var.get())
-        out_idx = self._parse_device_index(self.output_device_var.get())
-
-        self.mic_test_engine = MicTestEngine(in_idx, out_idx, self._set_level)
+        self.mic_test_engine = SwearBeeperEngine(config, self._log, journal_callback=self._on_swear_journal)
         try:
             self.mic_test_engine.start()
         except Exception as e:
@@ -982,11 +1075,12 @@ class App:
             return
 
         self.mic_test_btn.config(text="Остановить тест")
-        self._log("Тест микрофона запущен — говори и слушай себя через выбранный выход.")
+        self._log("Тест запущен — говори маты и слушай через выбранный выход (цензура применяется по-настоящему, как при Старт).")
 
-    def _set_level(self, level):
-        self.current_level = level
 
+    def _on_swear_journal(self, word):
+        timestamp = append_journal_entry(word)
+        self.journal_queue.put((timestamp, word))
 
     def _log(self, message):
         self.log_queue.put(message)
@@ -998,6 +1092,12 @@ class App:
             self.log_text.insert("end", msg + "\n")
             self.log_text.see("end")
             self.log_text.config(state="disabled")
+
+        while not self.journal_queue.empty():
+            ts, word = self.journal_queue.get_nowait()
+            self.journal_entries.append((ts, word))
+            self._append_journal_line(ts, word)
+
         self.root.after(100, self._poll_log_queue)
 
     def _poll_vu_meter(self):
@@ -1005,7 +1105,7 @@ class App:
         if self.engine and self.engine.running:
             level = getattr(self.engine, "level", 0.0)
         elif self.mic_test_engine and self.mic_test_engine.running:
-            level = self.current_level
+            level = getattr(self.mic_test_engine, "level", 0.0)
 
         self.level_display = 0.6 * self.level_display + 0.4 * level
         percent = level_to_percent(self.level_display)
@@ -1013,8 +1113,12 @@ class App:
         self.root.after(80, self._poll_vu_meter)
 
     def _poll_stats(self):
-        session_total = self.engine.stats.get("total", 0) if self.engine else 0
-        session_per_word = self.engine.stats.get("per_word", {}) if self.engine else {}
+        active_engine = self.engine if (self.engine and self.engine.running) else (
+            self.mic_test_engine if (self.mic_test_engine and self.mic_test_engine.running) else None
+        )
+
+        session_total = active_engine.stats.get("total", 0) if active_engine else 0
+        session_per_word = active_engine.stats.get("per_word", {}) if active_engine else {}
 
         alltime_total_display = self.alltime_stats["total"] + session_total
         combined_per_word = dict(self.alltime_stats["per_word"])
@@ -1024,7 +1128,8 @@ class App:
         self.stats_session_label.config(text=f"Матов за сессию: {session_total}")
         self.stats_alltime_label.config(text=f"Матов за всё время: {alltime_total_display}")
 
-        lines = [f"{w}: {c}" for w, c in sorted(combined_per_word.items(), key=lambda x: -x[1])]
+        ranked = sorted(combined_per_word.items(), key=lambda x: -x[1])
+        lines = [f"{i}. {w:<20} {c}" for i, (w, c) in enumerate(ranked, start=1)]
         content = "\n".join(lines) if lines else "(пока пусто)"
 
         self.stats_text.config(state="normal")
@@ -1035,18 +1140,20 @@ class App:
         self.root.after(1000, self._poll_stats)
 
     def _commit_session_stats_to_alltime(self):
-        if not self.engine:
-            return
-        session_total = self.engine.stats.get("total", 0)
-        self.alltime_stats["total"] += session_total
-        for w, c in self.engine.stats.get("per_word", {}).items():
-            self.alltime_stats["per_word"][w] = self.alltime_stats["per_word"].get(w, 0) + c
-        self.engine.stats = {"total": 0, "per_word": {}}
+        for eng in (self.engine, self.mic_test_engine):
+            if not eng:
+                continue
+            session_total = eng.stats.get("total", 0)
+            self.alltime_stats["total"] += session_total
+            for w, c in eng.stats.get("per_word", {}).items():
+                self.alltime_stats["per_word"][w] = self.alltime_stats["per_word"].get(w, 0) + c
+            eng.stats = {"total": 0, "per_word": {}}
 
     def _reset_session_stats(self):
-        if self.engine:
-            self.engine.stats = {"total": 0, "per_word": {}}
-            self._log("Статистика сессии сброшена.")
+        for eng in (self.engine, self.mic_test_engine):
+            if eng:
+                eng.stats = {"total": 0, "per_word": {}}
+        self._log("Статистика сессии сброшена.")
 
     def _reset_alltime_stats(self):
         self.alltime_stats = {"total": 0, "per_word": {}}
@@ -1055,14 +1162,18 @@ class App:
 
 
     def _collect_settings(self):
+        current_model_path = self.model_path_var.get()
+        default_model_path = resource_path("model_ru")
+        model_path_to_save = None if current_model_path == default_model_path else current_model_path
+
         return {
             "delay": self.delay_var.get(),
             "beep_volume": self.beep_volume_var.get(),
             "pad_before": self.pad_before_var.get(),
             "pad_after": self.pad_after_var.get(),
             "mic_gain": self.mic_gain_var.get(),
-            "model_path": self.model_path_var.get(),
-            "custom_beep_path": self.custom_beep_path_var.get() or None,
+            "model_path": model_path_to_save,
+            "custom_beep_paths": list(self.custom_beep_paths),
             "root_words": list(self.root_words),
             "whitelist_words": list(self.whitelist_words),
             "hotkey": self.hotkey_var.get() if hasattr(self, "hotkey_var") else DEFAULT_HOTKEY,
@@ -1070,6 +1181,7 @@ class App:
             "alltime_per_word": self.alltime_stats["per_word"],
             "input_device_name": self._parse_device_name(self.input_device_var.get()) if self.input_device_var.get() else None,
             "output_device_name": self._parse_device_name(self.output_device_var.get()) if self.output_device_var.get() else None,
+            "test_output_device_name": self._parse_device_name(self.test_output_device_var.get()) if self.test_output_device_var.get() else None,
         }
 
     def _autosave(self, *args):
@@ -1159,42 +1271,49 @@ class App:
         sys.exit(0)
 
 
-    def _on_start(self):
-        if self.mic_test_engine and self.mic_test_engine.running:
-            messagebox.showerror("Ошибка", "Сначала останови тест микрофона.")
-            return
+    def _validate_and_build_config(self, override_output_device=None):
+        output_device_combo_value = override_output_device or self.output_device_var.get()
 
-        if not self.input_device_var.get() or not self.output_device_var.get():
+        if not self.input_device_var.get() or not output_device_combo_value:
             messagebox.showerror("Ошибка", "Выбери микрофон и устройство вывода.")
-            return
+            return None
 
         model_path = self.model_path_var.get()
         if not os.path.isdir(model_path):
             messagebox.showerror("Ошибка", f"Папка модели не найдена: {model_path}")
-            return
+            return None
 
         if not self.root_words:
             messagebox.showerror("Ошибка", "Список запрещённых слов пуст — добавь хотя бы одно слово.")
-            return
+            return None
 
         self._autosave()
 
-        config = {
+        return {
             "model_path": model_path,
             "input_device": self._parse_device_index(self.input_device_var.get()),
-            "output_device": self._parse_device_index(self.output_device_var.get()),
+            "output_device": self._parse_device_index(output_device_combo_value),
             "delay_sec": self.delay_var.get(),
             "beep_volume": self.beep_volume_var.get(),
             "pad_before": self.pad_before_var.get(),
             "pad_after": self.pad_after_var.get(),
             "mic_gain": self.mic_gain_var.get(),
-            "custom_beep_path": self.custom_beep_path_var.get() or None,
+            "custom_beep_paths": list(self.custom_beep_paths),
             "swear_pattern": build_swear_pattern(self.root_words),
             "whitelist": set(self.whitelist_words),
             "block_ms": 50,
         }
 
-        self.engine = SwearBeeperEngine(config, self._log)
+    def _on_start(self):
+        if self.mic_test_engine and self.mic_test_engine.running:
+            messagebox.showerror("Ошибка", "Сначала останови тест микрофона.")
+            return
+
+        config = self._validate_and_build_config()
+        if config is None:
+            return
+
+        self.engine = SwearBeeperEngine(config, self._log, journal_callback=self._on_swear_journal)
 
         def run_engine():
             try:
