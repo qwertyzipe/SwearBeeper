@@ -5,6 +5,7 @@ import json
 import wave
 import math
 import queue
+import socket
 import threading
 import webbrowser
 import tkinter as tk
@@ -69,6 +70,29 @@ DEFAULT_PAD_BEFORE = -0.12
 DEFAULT_PAD_AFTER = 0.12
 DEFAULT_MIC_GAIN = 1.0
 DEFAULT_HOTKEY = "ctrl+alt+m"
+SINGLE_INSTANCE_PORT = 47821
+
+
+def try_acquire_single_instance():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        s.listen(5)
+        return s
+    except OSError:
+        s.close()
+        return None
+
+
+def signal_existing_instance():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        s.sendall(b"show")
+        s.close()
+    except Exception:
+        pass
 
 
 def resource_path(relative_path):
@@ -229,7 +253,6 @@ class DelayBuffer:
 
 
 class MicTestEngine:
-    """Лёгкий passthrough-движок для проверки микрофона (без Vosk, почти без задержки)."""
 
     def __init__(self, input_device, output_device, level_callback):
         self.input_device = input_device
@@ -434,7 +457,8 @@ class SwearBeeperEngine:
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, single_instance_lock=None):
+        self.single_instance_lock = single_instance_lock
         self.root = root
         self.root.title("Swear Beeper")
         self.root.geometry("660x780")
@@ -445,7 +469,7 @@ class App:
         self.level_display = 0.0
         self.tray_icon = None
         self.current_hotkey = None
-        self.alltime_stats = None  # заполнится после загрузки self.saved ниже
+        self.alltime_stats = None
 
         self.saved = load_settings()
         self.root_words = list(self.saved.get("root_words", DEFAULT_ROOT_CORES))
@@ -470,8 +494,9 @@ class App:
 
         self._setup_hotkey(self.saved.get("hotkey", DEFAULT_HOTKEY))
         self._setup_tray()
+        if getattr(self, "single_instance_lock", None):
+            threading.Thread(target=self._listen_single_instance, daemon=True).start()
 
-    # ---------------- UI ----------------
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
@@ -518,7 +543,6 @@ class App:
         ttk.Button(frame, text="Обновить устройства", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
         ttk.Button(frame, text="Скачать VB-CABLE", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
 
-        # VU-метр
         vu_frame = ttk.Frame(main_tab)
         vu_frame.pack(fill="x", **pad)
         ttk.Label(vu_frame, text="Уровень микрофона:").pack(side="left")
@@ -684,7 +708,6 @@ class App:
         reset_btn = ttk.Button(parent, text="↺", width=3, command=reset)
         reset_btn.grid(row=row, column=3, sticky="w", padx=(4, 0))
 
-    # ---------------- Устройства ----------------
 
     def _browse_model(self):
         path = filedialog.askdirectory(title="Выбери папку модели Vosk")
@@ -760,7 +783,6 @@ class App:
     def _parse_device_name(self, combo_value):
         return combo_value.split(":", 1)[1].strip() if ":" in combo_value else combo_value
 
-    # ---------------- Слова / белый список ----------------
 
     def _add_word(self):
         word = normalize_word(self.new_word_var.get())
@@ -871,7 +893,6 @@ class App:
         self._autosave()
         self._log(f"Импортировано: {added_roots} новых слов, {added_whitelist} в белый список")
 
-    # ---------------- Мьют / хоткей ----------------
 
     def _toggle_mute(self):
         if self.engine and self.engine.running:
@@ -932,7 +953,6 @@ class App:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось установить хоткей '{combo}': {e}")
 
-    # ---------------- Тест микрофона ----------------
 
     def _toggle_mic_test(self):
         if self.mic_test_engine and self.mic_test_engine.running:
@@ -967,7 +987,6 @@ class App:
     def _set_level(self, level):
         self.current_level = level
 
-    # ---------------- Логи / VU / статистика ----------------
 
     def _log(self, message):
         self.log_queue.put(message)
@@ -1034,7 +1053,6 @@ class App:
         self._autosave()
         self._log("Статистика за всё время сброшена.")
 
-    # ---------------- Настройки ----------------
 
     def _collect_settings(self):
         return {
@@ -1059,7 +1077,6 @@ class App:
             return
         save_settings(self._collect_settings())
 
-    # ---------------- Трей ----------------
 
     def _load_tray_icon_image(self):
         icon_path = resource_path("icon.ico")
@@ -1087,6 +1104,22 @@ class App:
         )
         self.tray_icon = pystray.Icon("SwearBeeper", image, "Swear Beeper", menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _listen_single_instance(self):
+        while True:
+            try:
+                conn, _ = self.single_instance_lock.accept()
+                data = conn.recv(1024)
+                conn.close()
+                if data:
+                    self.root.after(0, self._show_from_other_instance)
+            except Exception:
+                break
+
+    def _show_from_other_instance(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def _tray_show(self, icon=None, item=None):
         self.root.after(0, self.root.deiconify)
@@ -1125,7 +1158,6 @@ class App:
         self.root.destroy()
         sys.exit(0)
 
-    # ---------------- Старт / стоп движка ----------------
 
     def _on_start(self):
         if self.mic_test_engine and self.mic_test_engine.running:
@@ -1185,8 +1217,13 @@ class App:
 
 
 def main():
+    lock_socket = try_acquire_single_instance()
+    if lock_socket is None:
+        signal_existing_instance()
+        sys.exit(0)
+
     root = tk.Tk()
-    app = App(root)
+    app = App(root, single_instance_lock=lock_socket)
     root.mainloop()
 
 
