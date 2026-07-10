@@ -119,13 +119,13 @@ python -c "from PIL import Image; Image.open('icon.png').save('icon.ico')"
 **Базовая команда** (модель встраивается прямо в exe, один файл):
 
 ```bash
-pyinstaller --onefile --windowed --name SwearBeeper --add-data "model_ru;model_ru" --collect-all vosk beeper_gui.py
+py -3.12 -m PyInstaller --onefile --windowed --name SwearBeeper --add-data "model_ru;model_ru" --collect-all vosk --collect-all pystray --collect-all keyboard --clean beeper_gui.py
 ```
 
 **С иконкой:**
 
 ```bash
-pyinstaller --onefile --windowed --name SwearBeeper --icon=icon.ico --add-data "model_ru;model_ru" --collect-all vosk beeper_gui.py
+py -3.12 -m PyInstaller --onefile --windowed --name SwearBeeper --icon=icon.ico --add-data "model_ru;model_ru" --collect-all vosk --collect-all pystray --collect-all keyboard --clean beeper_gui.py
 ```
 
 Флаги:
@@ -144,13 +144,13 @@ pyinstaller --onefile --windowed --name SwearBeeper --icon=icon.ico --add-data "
 
 **Ошибка про `vosk` / нативные библиотеки при запуске exe:**
 ```bash
-pyinstaller --onefile --windowed --name SwearBeeper --add-data "model_ru;model_ru" --collect-all vosk --clean beeper_gui.py
+py -3.12 -m pyinstaller --onefile --windowed --name SwearBeeper --add-data "model_ru;model_ru" --collect-all vosk --clean beeper_gui.py
 ```
 `--clean` очищает кэш предыдущей сборки — полезно, если пересобираешь несколько раз подряд с разными флагами.
 
 **Ошибка про `sounddevice` / PortAudio:**
 ```bash
-pyinstaller --onefile --windowed --name SwearBeeper --add-data "model_ru;model_ru" --collect-all vosk --collect-all sounddevice beeper_gui.py
+py -3.12 -m pyinstaller --onefile --windowed --name SwearBeeper --add-data "model_ru;model_ru" --collect-all vosk --collect-all sounddevice beeper_gui.py
 ```
 
 **Антивирус ругается на собранный exe:**
