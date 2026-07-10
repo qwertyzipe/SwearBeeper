@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import wave
+import math
 import queue
 import threading
 import webbrowser
@@ -12,6 +13,19 @@ from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    PYSTRAY_AVAILABLE = True
+except ImportError:
+    PYSTRAY_AVAILABLE = False
+
+try:
+    import keyboard
+    KEYBOARD_AVAILABLE = True
+except ImportError:
+    KEYBOARD_AVAILABLE = False
 
 PLAYBACK_RATE = 48000
 REC_RATE = 16000
@@ -54,6 +68,7 @@ DEFAULT_BEEP_VOLUME = 0.12
 DEFAULT_PAD_BEFORE = -0.12
 DEFAULT_PAD_AFTER = 0.12
 DEFAULT_MIC_GAIN = 1.0
+DEFAULT_HOTKEY = "ctrl+alt+m"
 
 
 def resource_path(relative_path):
@@ -90,6 +105,10 @@ def save_settings(data):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def normalize_word(w):
+    return w.strip().lower().replace("ё", "е").replace("Ё", "Е")
 
 
 def resample_linear(x, orig_sr, target_sr):
@@ -129,6 +148,14 @@ def load_wav_mono_float(path, target_sr):
     if framerate != target_sr:
         data = resample_linear(data, framerate, target_sr)
     return data.astype(np.float32)
+
+
+def level_to_percent(level):
+    if level <= 1e-6:
+        return 0
+    db = 20 * math.log10(level)
+    db = max(-60.0, min(0.0, db))
+    return (db + 60.0) / 60.0 * 100.0
 
 
 class DelayBuffer:
@@ -201,6 +228,57 @@ class DelayBuffer:
             return True
 
 
+class MicTestEngine:
+    """Лёгкий passthrough-движок для проверки микрофона (без Vosk, почти без задержки)."""
+
+    def __init__(self, input_device, output_device, level_callback):
+        self.input_device = input_device
+        self.output_device = output_device
+        self.level_callback = level_callback
+        self.buffer = DelayBuffer(PLAYBACK_RATE, 0.05)
+        self.running = False
+        self.input_stream = None
+        self.output_stream = None
+
+    def start(self):
+        self.running = True
+        blocksize = int(PLAYBACK_RATE * 0.05)
+        self.input_stream = sd.InputStream(
+            samplerate=PLAYBACK_RATE, channels=1, dtype="float32",
+            blocksize=blocksize, callback=self._in_cb,
+            device=self.input_device, latency="high",
+        )
+        self.output_stream = sd.OutputStream(
+            samplerate=PLAYBACK_RATE, channels=1, dtype="float32",
+            blocksize=blocksize, callback=self._out_cb,
+            device=self.output_device, latency="high",
+        )
+        self.input_stream.start()
+        self.output_stream.start()
+
+    def stop(self):
+        self.running = False
+        if self.input_stream:
+            self.input_stream.stop()
+            self.input_stream.close()
+        if self.output_stream:
+            self.output_stream.stop()
+            self.output_stream.close()
+
+    def _in_cb(self, indata, frames, time_info, status):
+        mono = indata[:, 0].copy()
+        self.buffer.write(mono)
+        level = float(np.sqrt(np.mean(mono ** 2))) if len(mono) else 0.0
+        self.level_callback(level)
+
+    def _out_cb(self, outdata, frames, time_info, status):
+        ready = self.buffer.read_ready()
+        if ready >= frames:
+            outdata[:, 0] = self.buffer.read(frames)
+        else:
+            outdata[:, 0] = 0
+
+
 class SwearBeeperEngine:
     def __init__(self, config, log_callback):
         self.config = config
@@ -215,6 +293,9 @@ class SwearBeeperEngine:
         self.output_stream = None
         self.custom_beep = None
         self._partial_processed_count = 0
+        self.level = 0.0
+        self.manual_mute = False
+        self.stats = {"total": 0, "per_word": {}}
 
     def start(self):
         self.log("Загружаю модель Vosk...")
@@ -237,6 +318,7 @@ class SwearBeeperEngine:
         self.delay_buffer = DelayBuffer(PLAYBACK_RATE, self.config["delay_sec"])
         self.running = True
         self._partial_processed_count = 0
+        self.stats = {"total": 0, "per_word": {}}
 
         self.rec_thread = threading.Thread(target=self._recognition_loop, daemon=True)
         self.rec_thread.start()
@@ -274,11 +356,15 @@ class SwearBeeperEngine:
         gain = self.config.get("mic_gain", 1.0)
         if gain != 1.0:
             mono = np.clip(mono * gain, -1.0, 1.0).astype(np.float32)
+        self.level = float(np.sqrt(np.mean(mono ** 2))) if len(mono) else 0.0
         self.delay_buffer.write(mono)
         mono_16k = resample_linear(mono, PLAYBACK_RATE, REC_RATE)
         self.mic_queue.put(mono_16k)
 
     def _audio_out_callback(self, outdata, frames, time_info, status):
+        if self.manual_mute:
+            outdata[:, 0] = 0
+            return
         ready = self.delay_buffer.read_ready()
         if ready >= frames:
             outdata[:, 0] = self.delay_buffer.read(frames)
@@ -323,9 +409,12 @@ class SwearBeeperEngine:
 
     def _process_words(self, words):
         pattern = self.config["swear_pattern"]
+        whitelist = self.config.get("whitelist", set())
         for w in words:
             word = w.get("word", "")
-            word_normalized = word.replace("ё", "е").replace("Ё", "Е")
+            word_normalized = normalize_word(word)
+            if word_normalized in whitelist:
+                continue
             if pattern.match(word_normalized):
                 start_sample = int((w["start"] - self.config["pad_before"]) * PLAYBACK_RATE)
                 end_sample = int((w["end"] + self.config["pad_after"]) * PLAYBACK_RATE)
@@ -339,19 +428,33 @@ class SwearBeeperEngine:
                 ok = self.delay_buffer.stamp_beep(start_sample, end_sample, seg_fn)
                 tag = "OK" if ok else "ПОЗДНО"
                 self.log(f"[МАТ] '{word}' [{w['start']:.2f}s - {w['end']:.2f}s] -> бип: {tag}")
+                if ok:
+                    self.stats["total"] += 1
+                    self.stats["per_word"][word_normalized] = self.stats["per_word"].get(word_normalized, 0) + 1
 
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Swear Beeper")
-        self.root.geometry("620x740")
+        self.root.geometry("660x780")
         self.engine = None
+        self.mic_test_engine = None
         self.log_queue = queue.Queue()
+        self.current_level = 0.0
+        self.level_display = 0.0
+        self.tray_icon = None
+        self.current_hotkey = None
+        self.alltime_stats = None  # заполнится после загрузки self.saved ниже
 
         self.saved = load_settings()
         self.root_words = list(self.saved.get("root_words", DEFAULT_ROOT_CORES))
+        self.whitelist_words = list(self.saved.get("whitelist_words", []))
         self.custom_beep_path_var = tk.StringVar(value=self.saved.get("custom_beep_path", "") or "")
+        self.alltime_stats = {
+            "total": self.saved.get("alltime_total", 0),
+            "per_word": dict(self.saved.get("alltime_per_word", {})),
+        }
 
         self.devices = sd.query_devices()
 
@@ -360,7 +463,15 @@ class App:
         self._suppress_autosave = False
 
         self._poll_log_queue()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._poll_vu_meter()
+        self._poll_stats()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
+        self._setup_hotkey(self.saved.get("hotkey", DEFAULT_HOTKEY))
+        self._setup_tray()
+
+    # ---------------- UI ----------------
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
@@ -369,10 +480,19 @@ class App:
 
         main_tab = ttk.Frame(notebook)
         words_tab = ttk.Frame(notebook)
+        stats_tab = ttk.Frame(notebook)
         notebook.add(main_tab, text="Основное")
-        notebook.add(words_tab, text="Запрещённые слова")
+        notebook.add(words_tab, text="Слова")
+        notebook.add(stats_tab, text="Статистика")
 
-        # ---------- Основная вкладка ----------
+        self._build_main_tab(main_tab, pad)
+        self._build_words_tab(words_tab, pad)
+        self._build_stats_tab(stats_tab, pad)
+
+        self._refresh_devices()
+        self._restore_device_selection()
+
+    def _build_main_tab(self, main_tab, pad):
         frame = ttk.Frame(main_tab)
         frame.pack(fill="x", **pad)
 
@@ -385,18 +505,30 @@ class App:
 
         ttk.Label(frame, text="Микрофон (вход):").grid(row=1, column=0, sticky="w")
         self.input_device_var = tk.StringVar()
-        self.input_combo = ttk.Combobox(frame, textvariable=self.input_device_var, state="readonly", width=45)
+        self.input_combo = ttk.Combobox(frame, textvariable=self.input_device_var, state="readonly", width=42)
         self.input_combo.grid(row=1, column=1, columnspan=2, sticky="we")
         self.input_combo.bind("<<ComboboxSelected>>", lambda e: self._autosave())
 
         ttk.Label(frame, text="Выход (динамики / кабель):").grid(row=2, column=0, sticky="w")
         self.output_device_var = tk.StringVar()
-        self.output_combo = ttk.Combobox(frame, textvariable=self.output_device_var, state="readonly", width=45)
+        self.output_combo = ttk.Combobox(frame, textvariable=self.output_device_var, state="readonly", width=42)
         self.output_combo.grid(row=2, column=1, columnspan=2, sticky="we")
         self.output_combo.bind("<<ComboboxSelected>>", lambda e: self._autosave())
 
-        ttk.Button(frame, text="Обновить список устройств", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
-        ttk.Button(frame, text="Скачать VB-CABLE (для Discord)", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
+        ttk.Button(frame, text="Обновить устройства", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
+        ttk.Button(frame, text="Скачать VB-CABLE", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
+
+        # VU-метр
+        vu_frame = ttk.Frame(main_tab)
+        vu_frame.pack(fill="x", **pad)
+        ttk.Label(vu_frame, text="Уровень микрофона:").pack(side="left")
+        self.vu_bar = ttk.Progressbar(vu_frame, orient="horizontal", mode="determinate", maximum=100, length=300)
+        self.vu_bar.pack(side="left", padx=8, fill="x", expand=True)
+
+        test_frame = ttk.Frame(main_tab)
+        test_frame.pack(fill="x", **pad)
+        self.mic_test_btn = ttk.Button(test_frame, text="Тест микрофона (прослушать себя)", command=self._toggle_mic_test)
+        self.mic_test_btn.pack(side="left")
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -423,9 +555,27 @@ class App:
         beep_sound_frame = ttk.Frame(main_tab)
         beep_sound_frame.pack(fill="x", **pad)
         ttk.Label(beep_sound_frame, text="Кастомный звук бипа (.wav):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(beep_sound_frame, textvariable=self.custom_beep_path_var, width=35, state="readonly").grid(row=0, column=1, sticky="we")
+        ttk.Entry(beep_sound_frame, textvariable=self.custom_beep_path_var, width=30, state="readonly").grid(row=0, column=1, sticky="we")
         ttk.Button(beep_sound_frame, text="Обзор...", command=self._browse_beep_sound).grid(row=0, column=2)
-        ttk.Button(beep_sound_frame, text="Сбросить (стандартный тон)", command=self._reset_beep_sound).grid(row=1, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(beep_sound_frame, text="Прослушать", command=self._preview_beep_sound).grid(row=0, column=3, padx=(4, 0))
+        ttk.Button(beep_sound_frame, text="Сбросить (тон)", command=self._reset_beep_sound).grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
+
+        hotkey_frame = ttk.Frame(main_tab)
+        hotkey_frame.pack(fill="x", **pad)
+        ttk.Label(hotkey_frame, text="Хоткей мьют/анмьют:").grid(row=0, column=0, sticky="w")
+        self.hotkey_var = tk.StringVar(value=self.saved.get("hotkey", DEFAULT_HOTKEY))
+        self.hotkey_entry = ttk.Entry(hotkey_frame, textvariable=self.hotkey_var, width=20)
+        self.hotkey_entry.grid(row=0, column=1, sticky="w")
+        ttk.Button(hotkey_frame, text="Записать", command=self._record_hotkey).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(hotkey_frame, text="Применить", command=self._apply_hotkey).grid(row=0, column=3, padx=(4, 0))
+        self.mute_indicator = ttk.Label(hotkey_frame, text="Микрофон: активен", foreground="green")
+        self.mute_indicator.grid(row=0, column=4, padx=(12, 0))
+        if not KEYBOARD_AVAILABLE:
+            ttk.Label(hotkey_frame, text="(модуль 'keyboard' не установлен — хоткей недоступен)", foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w")
+        else:
+            ttk.Label(hotkey_frame, text="Нажми 'Записать', затем зажми нужную комбинацию клавиш", foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w")
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -442,17 +592,19 @@ class App:
         self.log_text = tk.Text(log_frame, height=10, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
-        # ---------- Вкладка со словами ----------
-        words_frame = ttk.Frame(words_tab)
-        words_frame.pack(fill="both", expand=True, **pad)
+    def _build_words_tab(self, words_tab, pad):
+        top_frame = ttk.Frame(words_tab)
+        top_frame.pack(fill="x", **pad)
+        ttk.Button(top_frame, text="Импорт списка слов...", command=self._import_words).pack(side="left", padx=4)
+        ttk.Button(top_frame, text="Экспорт списка слов...", command=self._export_words).pack(side="left", padx=4)
 
-        ttk.Label(words_frame, text="Список слов/корней, которые нужно запикивать:").pack(anchor="w")
+        ttk.Label(words_tab, text="Запрещённые слова/корни (будут запикиваться):").pack(anchor="w", padx=8)
 
-        list_container = ttk.Frame(words_frame)
-        list_container.pack(fill="both", expand=True, pady=4)
+        list_container = ttk.Frame(words_tab)
+        list_container.pack(fill="both", expand=True, padx=8, pady=4)
 
         scrollbar = ttk.Scrollbar(list_container, orient="vertical")
-        self.words_listbox = tk.Listbox(list_container, yscrollcommand=scrollbar.set, height=12)
+        self.words_listbox = tk.Listbox(list_container, yscrollcommand=scrollbar.set, height=8, selectmode="extended")
         scrollbar.config(command=self.words_listbox.yview)
         self.words_listbox.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -460,26 +612,60 @@ class App:
         for w in self.root_words:
             self.words_listbox.insert("end", w)
 
-        add_frame = ttk.Frame(words_frame)
-        add_frame.pack(fill="x", pady=6)
+        add_frame = ttk.Frame(words_tab)
+        add_frame.pack(fill="x", padx=8, pady=6)
         self.new_word_var = tk.StringVar()
         ttk.Entry(add_frame, textvariable=self.new_word_var, width=30).pack(side="left", padx=4)
         ttk.Button(add_frame, text="Добавить", command=self._add_word).pack(side="left", padx=4)
         ttk.Button(add_frame, text="Удалить выбранное", command=self._remove_word).pack(side="left", padx=4)
+        ttk.Button(add_frame, text="Очистить весь список", command=self._clear_words).pack(side="left", padx=4)
 
-        ttk.Label(
-            words_frame,
-            text="Подсказка: вводи корень слова без окончания (например 'хуй', а не 'хуйня') —\n"
-                 "приложение само учитывает типичные приставки и окончания.",
-            justify="left",
-        ).pack(anchor="w", pady=(6, 0))
+        ttk.Separator(words_tab, orient="horizontal").pack(fill="x", pady=8)
 
-        self._refresh_devices()
-        self._restore_device_selection()
+        ttk.Label(words_tab, text="Белый список (эти слова НЕ пикать, даже если похожи на мат):").pack(anchor="w", padx=8)
+
+        wl_container = ttk.Frame(words_tab)
+        wl_container.pack(fill="both", expand=True, padx=8, pady=4)
+
+        wl_scrollbar = ttk.Scrollbar(wl_container, orient="vertical")
+        self.whitelist_listbox = tk.Listbox(wl_container, yscrollcommand=wl_scrollbar.set, height=6, selectmode="extended")
+        wl_scrollbar.config(command=self.whitelist_listbox.yview)
+        self.whitelist_listbox.pack(side="left", fill="both", expand=True)
+        wl_scrollbar.pack(side="right", fill="y")
+
+        for w in self.whitelist_words:
+            self.whitelist_listbox.insert("end", w)
+
+        wl_add_frame = ttk.Frame(words_tab)
+        wl_add_frame.pack(fill="x", padx=8, pady=6)
+        self.new_whitelist_word_var = tk.StringVar()
+        ttk.Entry(wl_add_frame, textvariable=self.new_whitelist_word_var, width=30).pack(side="left", padx=4)
+        ttk.Button(wl_add_frame, text="Добавить в белый список", command=self._add_whitelist_word).pack(side="left", padx=4)
+        ttk.Button(wl_add_frame, text="Удалить выбранное", command=self._remove_whitelist_word).pack(side="left", padx=4)
+        ttk.Button(wl_add_frame, text="Очистить весь список", command=self._clear_whitelist).pack(side="left", padx=4)
+
+    def _build_stats_tab(self, stats_tab, pad):
+        frame = ttk.Frame(stats_tab)
+        frame.pack(fill="both", expand=True, **pad)
+
+        self.stats_session_label = ttk.Label(frame, text="Матов за сессию: 0", font=("", 13, "bold"))
+        self.stats_session_label.pack(anchor="w", pady=(0, 2))
+
+        self.stats_alltime_label = ttk.Label(frame, text="Матов за всё время: 0", font=("", 13, "bold"))
+        self.stats_alltime_label.pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(frame, text="Разбивка по словам (сессия + всё время вместе):").pack(anchor="w")
+        self.stats_text = tk.Text(frame, height=15, state="disabled")
+        self.stats_text.pack(fill="both", expand=True, pady=4)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(anchor="w", pady=(6, 0))
+        ttk.Button(btn_row, text="Сбросить статистику сессии", command=self._reset_session_stats).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row, text="Сбросить статистику за всё время", command=self._reset_alltime_stats).pack(side="left")
 
     def _add_slider(self, parent, row, label, var, frm, to, default_value):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
-        scale = ttk.Scale(parent, from_=frm, to=to, variable=var, orient="horizontal", length=230)
+        scale = ttk.Scale(parent, from_=frm, to=to, variable=var, orient="horizontal", length=220)
         scale.grid(row=row, column=1, sticky="we", padx=6)
         value_label = ttk.Label(parent, text=f"{var.get():.2f}", width=6)
         value_label.grid(row=row, column=2, sticky="w")
@@ -498,6 +684,8 @@ class App:
         reset_btn = ttk.Button(parent, text="↺", width=3, command=reset)
         reset_btn.grid(row=row, column=3, sticky="w", padx=(4, 0))
 
+    # ---------------- Устройства ----------------
+
     def _browse_model(self):
         path = filedialog.askdirectory(title="Выбери папку модели Vosk")
         if path:
@@ -513,31 +701,22 @@ class App:
         self.custom_beep_path_var.set("")
         self._autosave()
 
+    def _preview_beep_sound(self):
+        try:
+            out_val = self.output_device_var.get()
+            device_idx = self._parse_device_index(out_val) if out_val else None
+            path = self.custom_beep_path_var.get()
+            if path:
+                data = load_wav_mono_float(path, PLAYBACK_RATE)
+            else:
+                t = np.arange(int(PLAYBACK_RATE * 0.3)) / PLAYBACK_RATE
+                data = (self.beep_volume_var.get() * np.sin(2 * np.pi * BEEP_FREQ * t)).astype(np.float32)
+            sd.play(data, PLAYBACK_RATE, device=device_idx)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось воспроизвести звук: {e}")
+
     def _open_vbcable(self):
         webbrowser.open(VB_CABLE_URL)
-
-    def _add_word(self):
-        word = self.new_word_var.get().strip().lower()
-        if not word:
-            return
-        if word in self.root_words:
-            messagebox.showinfo("Инфо", "Это слово уже есть в списке.")
-            return
-        self.root_words.append(word)
-        self.words_listbox.insert("end", word)
-        self.new_word_var.set("")
-        self._autosave()
-
-    def _remove_word(self):
-        selection = self.words_listbox.curselection()
-        if not selection:
-            return
-        index = selection[0]
-        word = self.words_listbox.get(index)
-        self.words_listbox.delete(index)
-        if word in self.root_words:
-            self.root_words.remove(word)
-        self._autosave()
 
     def _refresh_devices(self):
         self.devices = sd.query_devices()
@@ -581,6 +760,215 @@ class App:
     def _parse_device_name(self, combo_value):
         return combo_value.split(":", 1)[1].strip() if ":" in combo_value else combo_value
 
+    # ---------------- Слова / белый список ----------------
+
+    def _add_word(self):
+        word = normalize_word(self.new_word_var.get())
+        if not word:
+            return
+        if word in self.root_words:
+            messagebox.showinfo("Инфо", "Это слово уже есть в списке.")
+            return
+        self.root_words.append(word)
+        self.words_listbox.insert("end", word)
+        self.new_word_var.set("")
+        self._autosave()
+
+    def _remove_word(self):
+        selection = self.words_listbox.curselection()
+        if not selection:
+            return
+        for index in sorted(selection, reverse=True):
+            word = self.words_listbox.get(index)
+            self.words_listbox.delete(index)
+            if word in self.root_words:
+                self.root_words.remove(word)
+        self._autosave()
+
+    def _clear_words(self):
+        if not self.root_words:
+            return
+        if not messagebox.askyesno("Подтверждение", "Удалить ВСЕ запрещённые слова из списка?"):
+            return
+        self.words_listbox.delete(0, "end")
+        self.root_words.clear()
+        self._autosave()
+
+    def _add_whitelist_word(self):
+        word = normalize_word(self.new_whitelist_word_var.get())
+        if not word:
+            return
+        if word in self.whitelist_words:
+            messagebox.showinfo("Инфо", "Это слово уже есть в белом списке.")
+            return
+        self.whitelist_words.append(word)
+        self.whitelist_listbox.insert("end", word)
+        self.new_whitelist_word_var.set("")
+        self._autosave()
+
+    def _remove_whitelist_word(self):
+        selection = self.whitelist_listbox.curselection()
+        if not selection:
+            return
+        for index in sorted(selection, reverse=True):
+            word = self.whitelist_listbox.get(index)
+            self.whitelist_listbox.delete(index)
+            if word in self.whitelist_words:
+                self.whitelist_words.remove(word)
+        self._autosave()
+
+    def _clear_whitelist(self):
+        if not self.whitelist_words:
+            return
+        if not messagebox.askyesno("Подтверждение", "Удалить ВЕСЬ белый список?"):
+            return
+        self.whitelist_listbox.delete(0, "end")
+        self.whitelist_words.clear()
+        self._autosave()
+
+    def _export_words(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+        if not path:
+            return
+        data = {"root_words": self.root_words, "whitelist_words": self.whitelist_words}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._log(f"Список слов экспортирован: {path}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {e}")
+
+    def _import_words(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл: {e}")
+            return
+
+        imported_roots = data.get("root_words", [])
+        imported_whitelist = data.get("whitelist_words", [])
+        added_roots = 0
+        added_whitelist = 0
+
+        for w in imported_roots:
+            wn = normalize_word(w)
+            if wn and wn not in self.root_words:
+                self.root_words.append(wn)
+                self.words_listbox.insert("end", wn)
+                added_roots += 1
+
+        for w in imported_whitelist:
+            wn = normalize_word(w)
+            if wn and wn not in self.whitelist_words:
+                self.whitelist_words.append(wn)
+                self.whitelist_listbox.insert("end", wn)
+                added_whitelist += 1
+
+        self._autosave()
+        self._log(f"Импортировано: {added_roots} новых слов, {added_whitelist} в белый список")
+
+    # ---------------- Мьют / хоткей ----------------
+
+    def _toggle_mute(self):
+        if self.engine and self.engine.running:
+            self.engine.manual_mute = not self.engine.manual_mute
+            state_text = "ЗАМЬЮЧЕН" if self.engine.manual_mute else "активен"
+            color = "red" if self.engine.manual_mute else "green"
+            self.mute_indicator.config(text=f"Микрофон: {state_text}", foreground=color)
+            self._log(f"Микрофон {state_text} (хоткей/трей)")
+        else:
+            self._log("Хоткей нажат, но приложение не запущено (нажми Старт).")
+
+    def _record_hotkey(self):
+        if not KEYBOARD_AVAILABLE:
+            messagebox.showerror("Ошибка", "Модуль 'keyboard' не установлен.")
+            return
+
+        self.hotkey_entry.config(state="disabled")
+        self.hotkey_var.set("Нажми комбинацию...")
+
+        def worker():
+            try:
+                combo = keyboard.read_hotkey(suppress=False)
+            except Exception as e:
+                combo = None
+                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Не удалось записать хоткей: {e}"))
+            self.root.after(0, lambda: self._on_hotkey_recorded(combo))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_hotkey_recorded(self, combo):
+        self.hotkey_entry.config(state="normal")
+        if combo:
+            self.hotkey_var.set(combo)
+            self._setup_hotkey(combo)
+            self._autosave()
+        else:
+            self.hotkey_var.set(self.current_hotkey or DEFAULT_HOTKEY)
+
+    def _apply_hotkey(self):
+        new_combo = self.hotkey_var.get().strip()
+        if not new_combo:
+            return
+        self._setup_hotkey(new_combo)
+        self._autosave()
+
+    def _setup_hotkey(self, combo):
+        if not KEYBOARD_AVAILABLE:
+            return
+        try:
+            if self.current_hotkey:
+                keyboard.remove_hotkey(self.current_hotkey)
+        except Exception:
+            pass
+        try:
+            keyboard.add_hotkey(combo, lambda: self.root.after(0, self._toggle_mute))
+            self.current_hotkey = combo
+            self._log(f"Хоткей установлен: {combo}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось установить хоткей '{combo}': {e}")
+
+    # ---------------- Тест микрофона ----------------
+
+    def _toggle_mic_test(self):
+        if self.mic_test_engine and self.mic_test_engine.running:
+            self.mic_test_engine.stop()
+            self.mic_test_engine = None
+            self.mic_test_btn.config(text="Тест микрофона (прослушать себя)")
+            self._log("Тест микрофона остановлен.")
+            return
+
+        if self.engine and self.engine.running:
+            messagebox.showerror("Ошибка", "Сначала останови основной движок (кнопка Стоп).")
+            return
+
+        if not self.input_device_var.get() or not self.output_device_var.get():
+            messagebox.showerror("Ошибка", "Выбери микрофон и устройство вывода.")
+            return
+
+        in_idx = self._parse_device_index(self.input_device_var.get())
+        out_idx = self._parse_device_index(self.output_device_var.get())
+
+        self.mic_test_engine = MicTestEngine(in_idx, out_idx, self._set_level)
+        try:
+            self.mic_test_engine.start()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось запустить тест микрофона: {e}")
+            self.mic_test_engine = None
+            return
+
+        self.mic_test_btn.config(text="Остановить тест")
+        self._log("Тест микрофона запущен — говори и слушай себя через выбранный выход.")
+
+    def _set_level(self, level):
+        self.current_level = level
+
+    # ---------------- Логи / VU / статистика ----------------
+
     def _log(self, message):
         self.log_queue.put(message)
 
@@ -593,6 +981,61 @@ class App:
             self.log_text.config(state="disabled")
         self.root.after(100, self._poll_log_queue)
 
+    def _poll_vu_meter(self):
+        level = 0.0
+        if self.engine and self.engine.running:
+            level = getattr(self.engine, "level", 0.0)
+        elif self.mic_test_engine and self.mic_test_engine.running:
+            level = self.current_level
+
+        self.level_display = 0.6 * self.level_display + 0.4 * level
+        percent = level_to_percent(self.level_display)
+        self.vu_bar["value"] = percent
+        self.root.after(80, self._poll_vu_meter)
+
+    def _poll_stats(self):
+        session_total = self.engine.stats.get("total", 0) if self.engine else 0
+        session_per_word = self.engine.stats.get("per_word", {}) if self.engine else {}
+
+        alltime_total_display = self.alltime_stats["total"] + session_total
+        combined_per_word = dict(self.alltime_stats["per_word"])
+        for w, c in session_per_word.items():
+            combined_per_word[w] = combined_per_word.get(w, 0) + c
+
+        self.stats_session_label.config(text=f"Матов за сессию: {session_total}")
+        self.stats_alltime_label.config(text=f"Матов за всё время: {alltime_total_display}")
+
+        lines = [f"{w}: {c}" for w, c in sorted(combined_per_word.items(), key=lambda x: -x[1])]
+        content = "\n".join(lines) if lines else "(пока пусто)"
+
+        self.stats_text.config(state="normal")
+        self.stats_text.delete("1.0", "end")
+        self.stats_text.insert("1.0", content)
+        self.stats_text.config(state="disabled")
+
+        self.root.after(1000, self._poll_stats)
+
+    def _commit_session_stats_to_alltime(self):
+        if not self.engine:
+            return
+        session_total = self.engine.stats.get("total", 0)
+        self.alltime_stats["total"] += session_total
+        for w, c in self.engine.stats.get("per_word", {}).items():
+            self.alltime_stats["per_word"][w] = self.alltime_stats["per_word"].get(w, 0) + c
+        self.engine.stats = {"total": 0, "per_word": {}}
+
+    def _reset_session_stats(self):
+        if self.engine:
+            self.engine.stats = {"total": 0, "per_word": {}}
+            self._log("Статистика сессии сброшена.")
+
+    def _reset_alltime_stats(self):
+        self.alltime_stats = {"total": 0, "per_word": {}}
+        self._autosave()
+        self._log("Статистика за всё время сброшена.")
+
+    # ---------------- Настройки ----------------
+
     def _collect_settings(self):
         return {
             "delay": self.delay_var.get(),
@@ -603,6 +1046,10 @@ class App:
             "model_path": self.model_path_var.get(),
             "custom_beep_path": self.custom_beep_path_var.get() or None,
             "root_words": list(self.root_words),
+            "whitelist_words": list(self.whitelist_words),
+            "hotkey": self.hotkey_var.get() if hasattr(self, "hotkey_var") else DEFAULT_HOTKEY,
+            "alltime_total": self.alltime_stats["total"],
+            "alltime_per_word": self.alltime_stats["per_word"],
             "input_device_name": self._parse_device_name(self.input_device_var.get()) if self.input_device_var.get() else None,
             "output_device_name": self._parse_device_name(self.output_device_var.get()) if self.output_device_var.get() else None,
         }
@@ -612,11 +1059,79 @@ class App:
             return
         save_settings(self._collect_settings())
 
-    def _on_close(self):
+    # ---------------- Трей ----------------
+
+    def _load_tray_icon_image(self):
+        icon_path = resource_path("icon.ico")
+        if os.path.isfile(icon_path):
+            try:
+                return Image.open(icon_path)
+            except Exception:
+                pass
+        img = Image.new("RGB", (64, 64), color=(30, 30, 30))
+        d = ImageDraw.Draw(img)
+        d.ellipse((8, 8, 56, 56), fill=(200, 50, 50))
+        d.text((18, 24), "SB", fill=(255, 255, 255))
+        return img
+
+    def _setup_tray(self):
+        if not PYSTRAY_AVAILABLE:
+            self._log("pystray/Pillow не установлены — трей недоступен (pip install pystray pillow)")
+            return
+
+        image = self._load_tray_icon_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("Показать окно", self._tray_show),
+            pystray.MenuItem("Мьют/Анмьют микро", self._tray_toggle_mute),
+            pystray.MenuItem("Выход", self._tray_exit),
+        )
+        self.tray_icon = pystray.Icon("SwearBeeper", image, "Swear Beeper", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _tray_show(self, icon=None, item=None):
+        self.root.after(0, self.root.deiconify)
+
+    def _tray_toggle_mute(self, icon=None, item=None):
+        self.root.after(0, self._toggle_mute)
+
+    def _tray_exit(self, icon=None, item=None):
+        self.root.after(0, self._full_exit)
+
+    def _on_window_close(self):
         self._autosave()
+        if PYSTRAY_AVAILABLE and self.tray_icon:
+            self.root.withdraw()
+            self._log("Свернуто в трей. Для полного выхода используй меню трея.")
+        else:
+            self._full_exit()
+
+    def _full_exit(self):
+        self._commit_session_stats_to_alltime()
+        self._autosave()
+        if self.engine:
+            self.engine.stop()
+        if self.mic_test_engine:
+            self.mic_test_engine.stop()
+        if KEYBOARD_AVAILABLE:
+            try:
+                keyboard.unhook_all_hotkeys()
+            except Exception:
+                pass
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
         self.root.destroy()
+        sys.exit(0)
+
+    # ---------------- Старт / стоп движка ----------------
 
     def _on_start(self):
+        if self.mic_test_engine and self.mic_test_engine.running:
+            messagebox.showerror("Ошибка", "Сначала останови тест микрофона.")
+            return
+
         if not self.input_device_var.get() or not self.output_device_var.get():
             messagebox.showerror("Ошибка", "Выбери микрофон и устройство вывода.")
             return
@@ -643,6 +1158,7 @@ class App:
             "mic_gain": self.mic_gain_var.get(),
             "custom_beep_path": self.custom_beep_path_var.get() or None,
             "swear_pattern": build_swear_pattern(self.root_words),
+            "whitelist": set(self.whitelist_words),
             "block_ms": 50,
         }
 
@@ -657,8 +1173,11 @@ class App:
         threading.Thread(target=run_engine, daemon=True).start()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self.mute_indicator.config(text="Микрофон: активен", foreground="green")
 
     def _on_stop(self):
+        self._commit_session_stats_to_alltime()
+        self._autosave()
         if self.engine:
             self.engine.stop()
         self.start_btn.config(state="normal")
