@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import random
 import json
 import wave
@@ -10,6 +11,8 @@ import socket
 import threading
 import webbrowser
 import datetime
+import urllib.request
+import urllib.error
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -117,6 +120,50 @@ DEFAULT_PAD_AFTER = 0.12
 DEFAULT_MIC_GAIN = 1.0
 DEFAULT_HOTKEY = "ctrl+alt+m"
 SINGLE_INSTANCE_PORT = 47821
+OBS_BRIDGE_PORT = 47823
+
+SCANCODE_TO_ENGLISH_KEY = {
+    30: "a", 48: "b", 46: "c", 32: "d", 18: "e", 33: "f", 34: "g", 35: "h",
+    23: "i", 36: "j", 37: "k", 38: "l", 50: "m", 49: "n", 24: "o", 25: "p",
+    16: "q", 19: "r", 31: "s", 20: "t", 22: "u", 47: "v", 17: "w", 45: "x",
+    21: "y", 44: "z",
+    2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6", 8: "7", 9: "8", 10: "9", 11: "0",
+    59: "f1", 60: "f2", 61: "f3", 62: "f4", 63: "f5", 64: "f6",
+    65: "f7", 66: "f8", 67: "f9", 68: "f10", 87: "f11", 88: "f12",
+}
+
+MODIFIER_KEY_NAMES = {
+    "ctrl": {"ctrl", "left ctrl", "right ctrl"},
+    "alt": {"alt", "left alt", "right alt", "alt gr"},
+    "shift": {"shift", "left shift", "right shift"},
+    "windows": {"windows", "left windows", "right windows"},
+}
+
+APP_VERSION = "1.2.0"
+GITHUB_REPO = "qwertyzipe/SwearBeeper"
+
+
+def parse_version(v):
+    parts = []
+    for chunk in v.strip().lstrip("v").split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def check_for_updates():
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "SwearBeeper-UpdateCheck"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest_tag = data.get("tag_name", "")
+        html_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases")
+        if not latest_tag:
+            return None, None
+        return latest_tag, html_url
+    except Exception:
+        return None, None
 
 
 def try_acquire_single_instance():
@@ -139,6 +186,66 @@ def signal_existing_instance():
         s.close()
     except Exception:
         pass
+
+
+class ObsBridgeServer:
+    """Локальный TCP-сервер: рассылает JSON-события подключённому OBS-скрипту
+    (счётчик матов, момент цензуры) построчно (JSON Lines)."""
+
+    def __init__(self, port):
+        self.port = port
+        self.server_socket = None
+        self.clients = []
+        self.lock = threading.Lock()
+        self.running = False
+
+    def start(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind(("127.0.0.1", self.port))
+            self.server_socket.listen(5)
+        except OSError:
+            return False
+        self.running = True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        return True
+
+    def _accept_loop(self):
+        while self.running:
+            try:
+                conn, _ = self.server_socket.accept()
+                with self.lock:
+                    self.clients.append(conn)
+            except Exception:
+                break
+
+    def broadcast(self, data):
+        line = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
+        with self.lock:
+            dead = []
+            for c in self.clients:
+                try:
+                    c.sendall(line)
+                except Exception:
+                    dead.append(c)
+            for d in dead:
+                self.clients.remove(d)
+
+    def stop(self):
+        self.running = False
+        with self.lock:
+            for c in self.clients:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            self.clients.clear()
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
 
 
 def resource_path(relative_path):
@@ -501,6 +608,14 @@ class App:
         if getattr(self, "single_instance_lock", None):
             threading.Thread(target=self._listen_single_instance, daemon=True).start()
 
+        self._check_updates_on_startup()
+
+        self.obs_bridge = ObsBridgeServer(OBS_BRIDGE_PORT)
+        if self.obs_bridge.start():
+            self._log(f"OBS-мост запущен на порту {OBS_BRIDGE_PORT}.")
+        else:
+            self._log(f"Не удалось запустить OBS-мост на порту {OBS_BRIDGE_PORT} (порт занят?).")
+
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
@@ -550,6 +665,7 @@ class App:
 
         ttk.Button(frame, text="Обновить устройства", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
         ttk.Button(frame, text="Скачать VB-CABLE", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
+        ttk.Button(frame, text="Проверить обновления", command=self._check_updates_clicked).grid(row=3, column=3, sticky="w", pady=(4, 4))
 
         vu_frame = ttk.Frame(main_tab)
         vu_frame.pack(fill="x", **pad)
@@ -823,6 +939,50 @@ class App:
     def _open_vbcable(self):
         webbrowser.open(VB_CABLE_URL)
 
+    def _check_updates_on_startup(self):
+        def worker():
+            latest_tag, html_url = check_for_updates()
+            self.root.after(0, lambda: self._on_startup_update_check_result(latest_tag, html_url))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_startup_update_check_result(self, latest_tag, html_url):
+        if latest_tag is None:
+            return
+
+        current = parse_version(APP_VERSION)
+        latest = parse_version(latest_tag)
+
+        if latest > current:
+            self._log(f"Доступна новая версия: {latest_tag} (у тебя {APP_VERSION})")
+            if messagebox.askyesno("Доступно обновление", f"Вышла новая версия {latest_tag} (у тебя {APP_VERSION}). Открыть страницу релиза?"):
+                webbrowser.open(html_url)
+
+    def _check_updates_clicked(self):
+        self._log("Проверяю обновления на GitHub...")
+
+        def worker():
+            latest_tag, html_url = check_for_updates()
+            self.root.after(0, lambda: self._on_update_check_result(latest_tag, html_url))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_check_result(self, latest_tag, html_url):
+        if latest_tag is None:
+            self._log("Не удалось проверить обновления (нет интернета или репозиторий недоступен).")
+            return
+
+        current = parse_version(APP_VERSION)
+        latest = parse_version(latest_tag)
+
+        if latest > current:
+            self._log(f"Доступна новая версия: {latest_tag} (у тебя {APP_VERSION})")
+            if messagebox.askyesno("Доступно обновление", f"Вышла новая версия {latest_tag} (у тебя {APP_VERSION}). Открыть страницу релиза?"):
+                webbrowser.open(html_url)
+        else:
+            self._log(f"У тебя последняя версия ({APP_VERSION}).")
+            messagebox.showinfo("Обновления", f"У тебя установлена последняя версия ({APP_VERSION}).")
+
     def _refresh_devices(self):
         self.devices = sd.query_devices()
         input_options = []
@@ -1009,11 +1169,38 @@ class App:
         self.hotkey_var.set("Нажми комбинацию...")
 
         def worker():
-            try:
-                combo = keyboard.read_hotkey(suppress=False)
-            except Exception as e:
+            modifiers = set()
+            result_holder = {}
+
+            def on_event(event):
+                if event.event_type != "down":
+                    return
+                name = (event.name or "").lower()
+
+                matched_modifier = None
+                for mod_label, variants in MODIFIER_KEY_NAMES.items():
+                    if name in variants:
+                        matched_modifier = mod_label
+                        break
+
+                if matched_modifier:
+                    modifiers.add(matched_modifier)
+                else:
+                    key_name = SCANCODE_TO_ENGLISH_KEY.get(event.scan_code, name)
+                    result_holder["key"] = key_name
+
+            hook = keyboard.hook(on_event)
+            start_time = time.time()
+            while "key" not in result_holder and time.time() - start_time < 15:
+                time.sleep(0.05)
+            keyboard.unhook(hook)
+
+            if "key" in result_holder:
+                combo_parts = sorted(modifiers) + [result_holder["key"]]
+                combo = "+".join(combo_parts)
+            else:
                 combo = None
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Не удалось записать хоткей: {e}"))
+
             self.root.after(0, lambda: self._on_hotkey_recorded(combo))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1078,9 +1265,26 @@ class App:
         self._log("Тест запущен — говори маты и слушай через выбранный выход (цензура применяется по-настоящему, как при Старт).")
 
 
+    def _get_current_totals(self):
+        active_engine = self.engine if (self.engine and self.engine.running) else (
+            self.mic_test_engine if (self.mic_test_engine and self.mic_test_engine.running) else None
+        )
+        session_total = active_engine.stats.get("total", 0) if active_engine else 0
+        alltime_total_display = self.alltime_stats["total"] + session_total
+        return session_total, alltime_total_display
+
     def _on_swear_journal(self, word):
         timestamp = append_journal_entry(word)
         self.journal_queue.put((timestamp, word))
+
+        if getattr(self, "obs_bridge", None):
+            session_total, alltime_total = self._get_current_totals()
+            self.obs_bridge.broadcast({
+                "type": "censor_event",
+                "session_total": session_total,
+                "alltime_total": alltime_total,
+                "ts": timestamp,
+            })
 
     def _log(self, message):
         self.log_queue.put(message)
@@ -1136,6 +1340,13 @@ class App:
         self.stats_text.delete("1.0", "end")
         self.stats_text.insert("1.0", content)
         self.stats_text.config(state="disabled")
+
+        if getattr(self, "obs_bridge", None):
+            self.obs_bridge.broadcast({
+                "type": "snapshot",
+                "session_total": session_total,
+                "alltime_total": alltime_total_display,
+            })
 
         self.root.after(1000, self._poll_stats)
 
@@ -1210,7 +1421,7 @@ class App:
 
         image = self._load_tray_icon_image()
         menu = pystray.Menu(
-            pystray.MenuItem("Показать окно", self._tray_show),
+            pystray.MenuItem("Показать окно", self._tray_show, default=True),
             pystray.MenuItem("Мьют/Анмьют микро", self._tray_toggle_mute),
             pystray.MenuItem("Выход", self._tray_exit),
         )
@@ -1267,6 +1478,8 @@ class App:
                 self.tray_icon.stop()
             except Exception:
                 pass
+        if getattr(self, "obs_bridge", None):
+            self.obs_bridge.stop()
         self.root.destroy()
         sys.exit(0)
 
