@@ -109,7 +109,7 @@ py -3.12 beeper_gui.py
 
 ```bash
 py -3.12 -m pip install pyinstaller
-py -3.12 -m PyInstaller --onefile --windowed --name SwearBeeper --icon=icon.ico --add-data "model_ru;model_ru" --collect-all vosk --collect-all pystray --collect-all keyboard --clean beeper_gui.py
+py -3.12 -m PyInstaller --onefile --windowed --name SwearBeeper --icon=icon.ico --add-data "icon.ico;." --add-data "model_ru;model_ru" --collect-all vosk --collect-all pystray --collect-all keyboard --clean beeper_gui.py
 ```
 
 Важно: всегда `py -3.12 -m PyInstaller`, не голое `pyinstaller`.
@@ -118,21 +118,33 @@ py -3.12 -m PyInstaller --onefile --windowed --name SwearBeeper --icon=icon.ico 
 
 - **"pyinstaller is not recognized"**: используй `py -3.12 -m PyInstaller`
 - **Ошибка про vosk/pystray/keyboard в exe**: проверь флаги `--collect-all`, пересобери с `--clean`
-- **PermissionError при сборке**: закрой старый exe полностью (проверь трей)
+- **PermissionError при сборке**: закрой старый exe полностью (проверь трей — приложение может тихо работать в фоне)
 - **Антивирус ругается**: ложная тревога для PyInstaller `--onefile`, читай исходники
-- **"Папка модели не найдена"**: нажми "Сбросить путь"
+- **"Папка модели не найдена"**: нажми "Сбросить путь" рядом с полем модели
+- **Иконка не появляется в панели задач/трее**: убедись, что добавлен флаг `--add-data "icon.ico;."` отдельно от `--icon=icon.ico`; также Windows агрессивно кэширует иконки exe — если не помогло, попробуй переименовать exe или почистить кэш иконок системы
 
 ## Структура
 
 ```
+
+## Структура
+ 
+```
 swear_beeper/
-├── beeper_gui.py
-├── model_ru/
-├── icon.ico
+├── beeper_gui.py          # точка входа
+├── gui.py                 # интерфейс приложения (класс App)
+├── config.py               # константы, настройки, журнал, профили
+├── audio_engine.py         # распознавание речи и цензура (движок)
+├── obs_bridge.py            # локальный мост для интеграции с OBS
+├── single_instance.py      # защита от повторного запуска
+├── updater.py               # проверка обновлений на GitHub
+├── ui_widgets.py             # тултипы и вспомогательные виджеты
+├── model_ru/                # модель Vosk (скачивается отдельно)
+├── icon.ico                  # иконка приложения
 ├── obs_script/
-│   ├── swear_beeper_obs.py
-│   └── README_OBS.md
+├── swear_beeper_obs.py
 └── README.md
+```
 ```
 
 ## Лицензия
