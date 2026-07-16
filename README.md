@@ -126,10 +126,6 @@ py -3.12 -m PyInstaller --onefile --windowed --name SwearBeeper --icon=icon.ico 
 ## Структура
 
 ```
-
-## Структура
- 
-```
 swear_beeper/
 ├── beeper_gui.py          # точка входа
 ├── gui.py                 # интерфейс приложения (класс App)
@@ -142,9 +138,9 @@ swear_beeper/
 ├── model_ru/                # модель Vosk (скачивается отдельно)
 ├── icon.ico                  # иконка приложения
 ├── obs_script/
-├── swear_beeper_obs.py
+│   ├── swear_beeper_obs.py
+│   └── README_OBS.md
 └── README.md
-```
 ```
 
 ## Лицензия
