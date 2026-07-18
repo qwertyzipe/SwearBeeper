@@ -7,7 +7,7 @@ import random
 import threading
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import numpy as np
 import sounddevice as sd
@@ -32,6 +32,7 @@ from config import (
     SCANCODE_TO_ENGLISH_KEY, MODIFIER_KEY_NAMES, APP_VERSION,
     resource_path, load_settings, save_settings,
     append_journal_entry, load_journal, clear_journal_file,
+    load_profiles, save_profiles,
 )
 from updater import parse_version, check_for_updates
 from single_instance import try_acquire_single_instance, signal_existing_instance
@@ -48,10 +49,9 @@ class App:
         self.single_instance_lock = single_instance_lock
         self.root = root
         self.root.title("Swear Beeper")
-        self.root.geometry("660x780")
-        self.root.minsize(560, 600)
-        self.root.maxsize(1100, 1000)
-        self._set_window_icon()
+        self.root.geometry("680x640")
+        self.root.minsize(560, 480)
+        self.root.maxsize(1200, 1300)
         self.engine = None
         self.mic_test_engine = None
         self.log_queue = queue.Queue()
@@ -66,7 +66,14 @@ class App:
         self.saved = load_settings()
         self.root_words = list(self.saved.get("root_words", DEFAULT_ROOT_CORES))
         self.whitelist_words = list(self.saved.get("whitelist_words", []))
-        self.custom_beep_paths = list(self.saved.get("custom_beep_paths", []) or [])
+
+        # Новый формат: список {"path": ..., "words": [...]}. Если в старых настройках
+        # остался плоский custom_beep_paths - мигрируем его в новый формат (words=[] = "любой мат").
+        self.custom_sound_mappings = list(self.saved.get("custom_sound_mappings", []) or [])
+        self.profiles = load_profiles()
+        for old_path in self.saved.get("custom_beep_paths", []) or []:
+            self.custom_sound_mappings.append({"path": old_path, "words": []})
+
         self.alltime_stats = {
             "total": self.saved.get("alltime_total", 0),
             "per_word": dict(self.saved.get("alltime_per_word", {})),
@@ -81,6 +88,7 @@ class App:
         self._poll_log_queue()
         self._poll_vu_meter()
         self._poll_stats()
+        self._set_window_icon()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
@@ -127,6 +135,29 @@ class App:
         self._restore_device_selection()
 
     def _build_main_tab(self, main_tab, pad):
+        canvas = tk.Canvas(main_tab, highlightthickness=0)
+        vscroll = ttk.Scrollbar(main_tab, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        def _on_canvas_resize(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        canvas.bind("<Configure>", _on_canvas_resize)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        main_tab = inner  # весь дальнейший код метода пакует виджеты внутрь прокручиваемого фрейма
+
         frame = ttk.Frame(main_tab)
         frame.pack(fill="x", **pad)
 
@@ -153,6 +184,19 @@ class App:
         ttk.Button(frame, text="Обновить устройства", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
         ttk.Button(frame, text="Скачать VB-CABLE", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
         ttk.Button(frame, text="Проверить обновления", command=self._check_updates_clicked).grid(row=3, column=3, sticky="w", pady=(4, 4))
+
+        ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
+
+        profile_frame = ttk.Frame(main_tab)
+        profile_frame.pack(fill="x", **pad)
+        ttk.Label(profile_frame, text="Набор (профиль слов/звуков/настроек):").pack(side="left")
+        self.profile_var = tk.StringVar(value="")
+        self.profile_combo = ttk.Combobox(profile_frame, textvariable=self.profile_var, state="readonly", width=22)
+        self.profile_combo["values"] = list(self.profiles.keys())
+        self.profile_combo.pack(side="left", padx=(6, 6))
+        ttk.Button(profile_frame, text="Загрузить", command=self._load_profile).pack(side="left", padx=2)
+        ttk.Button(profile_frame, text="Сохранить как...", command=self._save_profile_as).pack(side="left", padx=2)
+        ttk.Button(profile_frame, text="Удалить", command=self._delete_profile).pack(side="left", padx=2)
 
         vu_frame = ttk.Frame(main_tab)
         vu_frame.pack(fill="x", **pad)
@@ -200,26 +244,60 @@ class App:
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
+        mode_frame = ttk.Frame(main_tab)
+        mode_frame.pack(fill="x", **pad)
+        ttk.Label(mode_frame, text="Способ цензуры:").pack(side="left")
+        self.censor_mode_var = tk.StringVar(value=self.saved.get("censor_mode", "beep"))
+        ttk.Radiobutton(mode_frame, text="Бип/звук", variable=self.censor_mode_var, value="beep", command=self._autosave).pack(side="left", padx=(8, 4))
+        ttk.Radiobutton(mode_frame, text="Тишина (мьют)", variable=self.censor_mode_var, value="mute", command=self._autosave).pack(side="left")
+        mode_info_icon = tk.Label(mode_frame, text="\u2753", fg="gray", cursor="question_arrow")
+        mode_info_icon.pack(side="left", padx=(6, 0))
+        Tooltip(mode_info_icon, "Тишина - просто вырезает мат без звука вместо него. Полезно, если надоел звук бипа.")
+
+        noise_frame = ttk.Frame(main_tab)
+        noise_frame.pack(fill="x", **pad)
+        self.noise_suppression_var = tk.BooleanVar(value=self.saved.get("noise_suppression", False))
+        ttk.Checkbutton(
+            noise_frame, text="Шумоподавление микрофона (эксперимент)",
+            variable=self.noise_suppression_var, command=self._autosave,
+        ).pack(side="left")
+        noise_info_icon = tk.Label(noise_frame, text="\u2753", fg="gray", cursor="question_arrow")
+        noise_info_icon.pack(side="left", padx=(6, 0))
+        Tooltip(
+            noise_info_icon,
+            "Приглушает фоновый шум ДО распознавания и цензуры. По умолчанию выключено, "
+            "т.к. может немного снижать точность детекта. Включай, если у тебя шумный микрофон/помещение.",
+        )
+
+        ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
+
         beep_sound_frame = ttk.Frame(main_tab)
         beep_sound_frame.pack(fill="both", **pad)
-        ttk.Label(beep_sound_frame, text="Звуки вместо бипа (.wav) — при мате выбирается случайный из списка:").pack(anchor="w")
+        ttk.Label(beep_sound_frame, text="Звуки вместо бипа (.wav) — можно привязать к конкретным словам:").pack(anchor="w")
 
         beep_list_container = ttk.Frame(beep_sound_frame)
         beep_list_container.pack(fill="x", pady=4)
         beep_scrollbar = ttk.Scrollbar(beep_list_container, orient="vertical")
-        self.beep_sounds_listbox = tk.Listbox(beep_list_container, yscrollcommand=beep_scrollbar.set, height=4, selectmode="extended")
+        self.beep_sounds_listbox = tk.Listbox(beep_list_container, yscrollcommand=beep_scrollbar.set, height=5, selectmode="extended")
         beep_scrollbar.config(command=self.beep_sounds_listbox.yview)
         self.beep_sounds_listbox.pack(side="left", fill="x", expand=True)
         beep_scrollbar.pack(side="right", fill="y")
-        for p in self.custom_beep_paths:
-            self.beep_sounds_listbox.insert("end", p)
+        for entry in self.custom_sound_mappings:
+            self.beep_sounds_listbox.insert("end", self._format_sound_mapping_row(entry))
 
         beep_btn_row = ttk.Frame(beep_sound_frame)
         beep_btn_row.pack(fill="x", pady=(4, 0))
-        ttk.Button(beep_btn_row, text="Добавить звук(и)...", command=self._add_beep_sounds).pack(side="left", padx=(0, 4))
+        ttk.Button(beep_btn_row, text="Добавить звук...", command=self._add_sound_mapping).pack(side="left", padx=(0, 4))
+        ttk.Button(beep_btn_row, text="Изменить слова у выбранного", command=self._edit_sound_mapping_words).pack(side="left", padx=(0, 4))
         ttk.Button(beep_btn_row, text="Удалить выбранное", command=self._remove_beep_sound).pack(side="left", padx=(0, 4))
-        ttk.Button(beep_btn_row, text="Очистить (вернуть тон)", command=self._reset_beep_sound).pack(side="left", padx=(0, 4))
-        ttk.Button(beep_btn_row, text="Прослушать случайный", command=self._preview_beep_sound).pack(side="left")
+        ttk.Button(beep_btn_row, text="Очистить всё", command=self._reset_beep_sound).pack(side="left", padx=(0, 4))
+        ttk.Button(beep_btn_row, text="Прослушать выбранное/случайное", command=self._preview_beep_sound).pack(side="left")
+
+        ttk.Label(
+            beep_sound_frame,
+            text="Пустой список слов у звука = звук для ЛЮБОГО мата (общий пул). Если у слова есть свой звук — используется он.",
+            foreground="gray",
+        ).pack(anchor="w", pady=(4, 0))
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -252,7 +330,7 @@ class App:
         log_frame = ttk.Frame(main_tab)
         log_frame.pack(fill="both", expand=True, **pad)
         ttk.Label(log_frame, text="Лог:").pack(anchor="w")
-        self.log_text = tk.Text(log_frame, height=10, state="disabled")
+        self.log_text = tk.Text(log_frame, height=7, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
     def _build_words_tab(self, words_tab, pad):
@@ -386,6 +464,129 @@ class App:
             add_info_icon(parent, row, 4, tooltip_text)
 
 
+    def _format_sound_mapping_row(self, entry):
+        name = os.path.basename(entry.get("path", "?"))
+        words = entry.get("words", [])
+        label = ", ".join(words) if words else "(любой мат)"
+        return f"{name} -> {label}"
+
+    def _add_sound_mapping(self):
+        paths = filedialog.askopenfilenames(title="Выбери .wav файл(ы)", filetypes=[("WAV files", "*.wav")])
+        if not paths:
+            return
+        for p in paths:
+            words_str = simpledialog.askstring(
+                "Слова для звука",
+                f"На какие слова триггерить звук '{os.path.basename(p)}'?\n"
+                "Через запятую (например: бля, блять). Оставь пустым - звук для ЛЮБОГО мата.",
+                parent=self.root,
+            )
+            words = [normalize_word(w) for w in (words_str or "").split(",") if w.strip()]
+            entry = {"path": p, "words": words}
+            self.custom_sound_mappings.append(entry)
+            self.beep_sounds_listbox.insert("end", self._format_sound_mapping_row(entry))
+        self._autosave()
+
+    def _edit_sound_mapping_words(self):
+        selection = self.beep_sounds_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Инфо", "Сначала выбери звук в списке.")
+            return
+        index = selection[0]
+        entry = self.custom_sound_mappings[index]
+        current_words = ", ".join(entry.get("words", []))
+        words_str = simpledialog.askstring(
+            "Слова для звука",
+            f"Слова для '{os.path.basename(entry['path'])}' (через запятую, пусто = любой мат):",
+            initialvalue=current_words,
+            parent=self.root,
+        )
+        if words_str is None:
+            return
+        entry["words"] = [normalize_word(w) for w in words_str.split(",") if w.strip()]
+        self.beep_sounds_listbox.delete(index)
+        self.beep_sounds_listbox.insert(index, self._format_sound_mapping_row(entry))
+        self._autosave()
+
+    def _collect_profile_snapshot(self):
+        return {
+            "delay": self.delay_var.get(),
+            "beep_volume": self.beep_volume_var.get(),
+            "pad_before": self.pad_before_var.get(),
+            "pad_after": self.pad_after_var.get(),
+            "mic_gain": self.mic_gain_var.get(),
+            "noise_suppression": self.noise_suppression_var.get(),
+            "root_words": list(self.root_words),
+            "whitelist_words": list(self.whitelist_words),
+            "custom_sound_mappings": list(self.custom_sound_mappings),
+            "censor_mode": self.censor_mode_var.get(),
+            "hotkey": self.hotkey_var.get(),
+        }
+
+    def _apply_profile_snapshot(self, data):
+        self.delay_var.set(data.get("delay", DEFAULT_DELAY))
+        self.beep_volume_var.set(data.get("beep_volume", DEFAULT_BEEP_VOLUME))
+        self.pad_before_var.set(data.get("pad_before", DEFAULT_PAD_BEFORE))
+        self.pad_after_var.set(data.get("pad_after", DEFAULT_PAD_AFTER))
+        self.mic_gain_var.set(data.get("mic_gain", DEFAULT_MIC_GAIN))
+        self.censor_mode_var.set(data.get("censor_mode", "beep"))
+        self.noise_suppression_var.set(data.get("noise_suppression", False))
+
+        self.root_words = list(data.get("root_words", DEFAULT_ROOT_CORES))
+        self.words_listbox.delete(0, "end")
+        for w in self.root_words:
+            self.words_listbox.insert("end", w)
+
+        self.whitelist_words = list(data.get("whitelist_words", []))
+        self.whitelist_listbox.delete(0, "end")
+        for w in self.whitelist_words:
+            self.whitelist_listbox.insert("end", w)
+
+        self.custom_sound_mappings = list(data.get("custom_sound_mappings", []))
+        self.beep_sounds_listbox.delete(0, "end")
+        for entry in self.custom_sound_mappings:
+            self.beep_sounds_listbox.insert("end", self._format_sound_mapping_row(entry))
+
+        hotkey = data.get("hotkey", DEFAULT_HOTKEY)
+        self.hotkey_var.set(hotkey)
+        self._setup_hotkey(hotkey)
+
+        self._autosave()
+
+    def _refresh_profile_combo(self):
+        self.profile_combo["values"] = list(self.profiles.keys())
+
+    def _save_profile_as(self):
+        name = simpledialog.askstring("Сохранить набор", "Имя набора:", parent=self.root)
+        if not name:
+            return
+        self.profiles[name] = self._collect_profile_snapshot()
+        save_profiles(self.profiles)
+        self._refresh_profile_combo()
+        self.profile_var.set(name)
+        self._log(f"Набор '{name}' сохранён.")
+
+    def _load_profile(self):
+        name = self.profile_var.get()
+        if not name or name not in self.profiles:
+            messagebox.showinfo("Инфо", "Выбери существующий набор из списка.")
+            return
+        self._apply_profile_snapshot(self.profiles[name])
+        self._log(f"Набор '{name}' загружен.")
+
+    def _delete_profile(self):
+        name = self.profile_var.get()
+        if not name or name not in self.profiles:
+            messagebox.showinfo("Инфо", "Выбери существующий набор из списка.")
+            return
+        if not messagebox.askyesno("Подтверждение", f"Удалить набор '{name}'?"):
+            return
+        del self.profiles[name]
+        save_profiles(self.profiles)
+        self._refresh_profile_combo()
+        self.profile_var.set("")
+        self._log(f"Набор '{name}' удалён.")
+
     def _reset_model_path(self):
         self.model_path_var.set(resource_path("model_ru"))
         self._autosave()
@@ -395,38 +596,34 @@ class App:
         if path:
             self.model_path_var.set(path)
 
-    def _add_beep_sounds(self):
-        paths = filedialog.askopenfilenames(title="Выбери .wav файл(ы) для замены бипа", filetypes=[("WAV files", "*.wav")])
-        if not paths:
-            return
-        for p in paths:
-            if p not in self.custom_beep_paths:
-                self.custom_beep_paths.append(p)
-                self.beep_sounds_listbox.insert("end", p)
-        self._autosave()
-
     def _remove_beep_sound(self):
         selection = self.beep_sounds_listbox.curselection()
         if not selection:
             return
         for index in sorted(selection, reverse=True):
-            path = self.beep_sounds_listbox.get(index)
             self.beep_sounds_listbox.delete(index)
-            if path in self.custom_beep_paths:
-                self.custom_beep_paths.remove(path)
+            del self.custom_sound_mappings[index]
         self._autosave()
 
     def _reset_beep_sound(self):
         self.beep_sounds_listbox.delete(0, "end")
-        self.custom_beep_paths.clear()
+        self.custom_sound_mappings.clear()
         self._autosave()
 
     def _preview_beep_sound(self):
         try:
             out_val = self.test_output_device_var.get() or self.output_device_var.get()
             device_idx = self._parse_device_index(out_val) if out_val else None
-            if self.custom_beep_paths:
-                path = random.choice(self.custom_beep_paths)
+
+            selection = self.beep_sounds_listbox.curselection()
+            if selection and self.custom_sound_mappings:
+                entry = self.custom_sound_mappings[selection[0]]
+                path = entry["path"]
+                data = load_wav_mono_float(path, PLAYBACK_RATE)
+                self._log(f"Превью: {os.path.basename(path)}")
+            elif self.custom_sound_mappings:
+                entry = random.choice(self.custom_sound_mappings)
+                path = entry["path"]
                 data = load_wav_mono_float(path, PLAYBACK_RATE)
                 self._log(f"Превью случайного звука: {os.path.basename(path)}")
             else:
@@ -888,6 +1085,7 @@ class App:
                 "type": "snapshot",
                 "session_total": session_total,
                 "alltime_total": alltime_total_display,
+                "delay_sec": self.delay_var.get(),
             })
 
         self.root.after(1000, self._poll_stats)
@@ -926,7 +1124,9 @@ class App:
             "pad_after": self.pad_after_var.get(),
             "mic_gain": self.mic_gain_var.get(),
             "model_path": model_path_to_save,
-            "custom_beep_paths": list(self.custom_beep_paths),
+            "custom_sound_mappings": list(self.custom_sound_mappings),
+            "censor_mode": self.censor_mode_var.get() if hasattr(self, "censor_mode_var") else "beep",
+            "noise_suppression": self.noise_suppression_var.get() if hasattr(self, "noise_suppression_var") else False,
             "root_words": list(self.root_words),
             "whitelist_words": list(self.whitelist_words),
             "hotkey": self.hotkey_var.get() if hasattr(self, "hotkey_var") else DEFAULT_HOTKEY,
@@ -984,19 +1184,27 @@ class App:
 
     def _set_window_icon(self):
         icon_path = resource_path("icon.ico")
-        if os.path.isfile(icon_path):
-            try:
-                self.root.iconbitmap(icon_path)
-            except Exception:
-                pass
+        if not os.path.isfile(icon_path):
+            self._log(f"icon.ico не найден по пути: {icon_path} (иконка окна/трея не будет установлена)")
+            return
+        try:
+            self.root.iconbitmap(default=icon_path)
+            self.root.update_idletasks()
+            self._log(f"Иконка окна установлена: {icon_path}")
+        except Exception as e:
+            self._log(f"Не удалось установить иконку окна: {e}")
 
     def _load_tray_icon_image(self):
         icon_path = resource_path("icon.ico")
         if os.path.isfile(icon_path):
             try:
-                return Image.open(icon_path)
-            except Exception:
-                pass
+                img = Image.open(icon_path)
+                self._log(f"Иконка трея загружена: {icon_path}")
+                return img
+            except Exception as e:
+                self._log(f"Не удалось открыть icon.ico для трея: {e}")
+        else:
+            self._log(f"icon.ico не найден по пути: {icon_path} - использую запасной значок трея")
         img = Image.new("RGB", (64, 64), color=(30, 30, 30))
         d = ImageDraw.Draw(img)
         d.ellipse((8, 8, 56, 56), fill=(200, 50, 50))
@@ -1129,7 +1337,9 @@ class App:
             "pad_before": self.pad_before_var.get(),
             "pad_after": self.pad_after_var.get(),
             "mic_gain": self.mic_gain_var.get(),
-            "custom_beep_paths": list(self.custom_beep_paths),
+            "custom_sound_mappings": list(self.custom_sound_mappings),
+            "censor_mode": self.censor_mode_var.get(),
+            "noise_suppression": self.noise_suppression_var.get(),
             "swear_pattern": build_swear_pattern(self.root_words),
             "whitelist": set(self.whitelist_words),
             "block_ms": 50,

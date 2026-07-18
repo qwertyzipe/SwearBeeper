@@ -39,6 +39,7 @@ PREFIXES = ["", "по", "на", "рас", "раз", "разъ", "за", "вы", 
 VB_CABLE_URL = "https://vb-audio.com/Cable/"
 SETTINGS_FILENAME = "swear_beeper_settings.json"
 JOURNAL_FILENAME = "swear_beeper_journal.log"
+PROFILES_FILENAME = "swear_beeper_profiles.json"
 
 DEFAULT_DELAY = 1.5
 DEFAULT_BEEP_VOLUME = 0.12
@@ -66,7 +67,7 @@ MODIFIER_KEY_NAMES = {
     "windows": {"windows", "left windows", "right windows"},
 }
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 GITHUB_REPO = "qwertyzipe/SwearBeeper"
 
 
@@ -145,3 +146,28 @@ def clear_journal_file():
             os.remove(path)
     except Exception:
         pass
+
+
+def profiles_path():
+    return os.path.join(_base_dir(), PROFILES_FILENAME)
+
+
+def load_profiles():
+    path = profiles_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_profiles(data):
+    path = profiles_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+

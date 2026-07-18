@@ -21,7 +21,13 @@ settings_cache = {
     "counter_format": "Маты: {session}",
     "timer_source": "",
     "timer_format": "Без мата: {time}",
+    "video_sources": [],
+    "auto_sync_delay": True,
+    "manual_delay_ms": 0,
 }
+
+VIDEO_DELAY_FILTER_NAME = "SwearBeeper Sync Delay"
+_last_applied_delay_ms = {}
 
 
 def script_description():
@@ -37,12 +43,19 @@ def script_description():
         "3. (Опционально) добавь Media Source со звуковым файлом, назови, например 'CensorSound'.\n"
         "4. (Опционально) создай текстовый источник для таймера 'без мата', например 'NoSwearTimer'.\n"
         "5. Впиши точные названия этих источников в настройках скрипта ниже.\n"
-        "6. Запусти SwearBeeper и нажми Старт (или Тест микрофона) — счётчик и баннер должны заработать."
+        "6. Запусти SwearBeeper и нажми Старт (или Тест микрофона) — счётчик и баннер должны заработать.\n\n"
+        "СИНХРОНИЗАЦИЯ ВИДЕО С ЗАДЕРЖКОЙ ЗВУКА:\n"
+        "Раз звук выходит с задержкой (~1-2 сек), картинка (веб-камера/захват игры) может "
+        "визуально 'опережать' звук. Укажи в поле 'Видео-источник' имя источника (например твоей "
+        "веб-камеры), включи 'Авто-синхронизация' — скрипт сам навесит на него фильтр "
+        "'Video Delay (Async)' и будет держать задержку видео равной задержке звука в SwearBeeper. "
+        "Либо выключи авто-синхронизацию и задай задержку вручную в миллисекундах."
     )
 
 
 def script_properties():
     props = obs.obs_properties_create()
+    obs.obs_properties_add_int(props, "port", "Порт подключения к SwearBeeper (см. лог приложения)", 1024, 65535, 1)
     obs.obs_properties_add_text(props, "counter_source", "Текстовый источник счётчика", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "counter_format", "Формат текста счётчика", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "banner_source", "Источник баннера (текст/картинка)", obs.OBS_TEXT_DEFAULT)
@@ -50,10 +63,14 @@ def script_properties():
     obs.obs_properties_add_text(props, "sound_source", "Media-источник звука (опционально)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "timer_source", "Текстовый источник таймера 'без мата'", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "timer_format", "Формат текста таймера", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(props, "video_source", "Видео-источники для синхронизации (через запятую: камера, захват игры)", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_bool(props, "auto_sync_delay", "Авто-синхронизация с задержкой SwearBeeper")
+    obs.obs_properties_add_int(props, "manual_delay_ms", "Задержка видео вручную (мс, если авто выключена)", 0, 10000, 50)
     return props
 
 
 def script_defaults(settings):
+    obs.obs_data_set_default_int(settings, "port", PORT)
     obs.obs_data_set_default_string(settings, "counter_source", "")
     obs.obs_data_set_default_string(settings, "counter_format", "Маты: {session}")
     obs.obs_data_set_default_string(settings, "banner_source", "")
@@ -61,9 +78,14 @@ def script_defaults(settings):
     obs.obs_data_set_default_string(settings, "sound_source", "")
     obs.obs_data_set_default_string(settings, "timer_source", "")
     obs.obs_data_set_default_string(settings, "timer_format", "Без мата: {time}")
+    obs.obs_data_set_default_string(settings, "video_source", "")
+    obs.obs_data_set_default_bool(settings, "auto_sync_delay", True)
+    obs.obs_data_set_default_int(settings, "manual_delay_ms", 0)
 
 
 def script_update(settings):
+    global PORT
+    PORT = obs.obs_data_get_int(settings, "port") or PORT
     settings_cache["counter_source"] = obs.obs_data_get_string(settings, "counter_source")
     settings_cache["counter_format"] = obs.obs_data_get_string(settings, "counter_format") or "Маты: {session}"
     settings_cache["banner_source"] = obs.obs_data_get_string(settings, "banner_source")
@@ -71,6 +93,13 @@ def script_update(settings):
     settings_cache["sound_source"] = obs.obs_data_get_string(settings, "sound_source")
     settings_cache["timer_source"] = obs.obs_data_get_string(settings, "timer_source")
     settings_cache["timer_format"] = obs.obs_data_get_string(settings, "timer_format") or "Без мата: {time}"
+    raw_sources = obs.obs_data_get_string(settings, "video_source")
+    settings_cache["video_sources"] = [s.strip() for s in raw_sources.split(",") if s.strip()]
+    settings_cache["auto_sync_delay"] = obs.obs_data_get_bool(settings, "auto_sync_delay")
+    settings_cache["manual_delay_ms"] = obs.obs_data_get_int(settings, "manual_delay_ms")
+
+    if not settings_cache["auto_sync_delay"]:
+        _apply_video_delay(settings_cache["manual_delay_ms"])
 
 
 def script_load(settings):
@@ -163,6 +192,89 @@ def _hide_banner_once():
     obs.timer_remove(_hide_banner_once)
 
 
+RENDER_DELAY_MAX_MS = 500
+MAX_STACKED_FILTERS = 20
+
+
+def _is_async_source(source):
+    try:
+        flags = obs.obs_source_get_output_flags(source)
+        return bool(flags & obs.OBS_SOURCE_ASYNC)
+    except Exception:
+        return True  # по умолчанию считаем async (веб-камера) - безопаснее для типичного случая
+
+
+def _create_or_update_filter(source, filt_name, filter_id, delay_ms):
+    existing = obs.obs_source_get_filter_by_name(source, filt_name)
+    filter_settings = obs.obs_data_create()
+    obs.obs_data_set_int(filter_settings, "delay_ms", delay_ms)
+
+    if existing:
+        obs.obs_source_update(existing, filter_settings)
+        obs.obs_source_release(existing)
+    else:
+        new_filter = obs.obs_source_create(filter_id, filt_name, filter_settings, None)
+        if new_filter:
+            obs.obs_source_filter_add(source, new_filter)
+            obs.obs_source_release(new_filter)
+
+    obs.obs_data_release(filter_settings)
+
+
+def _remove_filter_if_exists(source, filt_name):
+    existing = obs.obs_source_get_filter_by_name(source, filt_name)
+    if existing:
+        obs.obs_source_filter_remove(source, existing)
+        obs.obs_source_release(existing)
+
+
+def _cleanup_stacked_filters(source, keep_names):
+    for i in range(1, MAX_STACKED_FILTERS + 1):
+        name = f"{VIDEO_DELAY_FILTER_NAME} {i}"
+        if name not in keep_names:
+            _remove_filter_if_exists(source, name)
+
+
+def _apply_delay_to_source(source_name, delay_ms):
+    if _last_applied_delay_ms.get(source_name) == delay_ms:
+        return
+
+    source = obs.obs_get_source_by_name(source_name)
+    if not source:
+        return
+
+    if _is_async_source(source):
+        # Веб-камера / медиа-источник - обычный "Video Delay (Async)", без ограничения по мс
+        _create_or_update_filter(source, VIDEO_DELAY_FILTER_NAME, "async_delay_filter", delay_ms)
+        _cleanup_stacked_filters(source, keep_names=[])
+    else:
+        # Захват экрана/окна/игры - "Render Delay", максимум 500мс на инстанс,
+        # поэтому при необходимости складываем несколько фильтров подряд.
+        _remove_filter_if_exists(source, VIDEO_DELAY_FILTER_NAME)
+
+        remaining = delay_ms
+        idx = 1
+        active_names = []
+        while remaining > 0 and idx <= MAX_STACKED_FILTERS:
+            chunk = min(remaining, RENDER_DELAY_MAX_MS)
+            filt_name = f"{VIDEO_DELAY_FILTER_NAME} {idx}"
+            _create_or_update_filter(source, filt_name, "gpu_delay", chunk)
+            active_names.append(filt_name)
+            remaining -= chunk
+            idx += 1
+
+        _cleanup_stacked_filters(source, keep_names=active_names)
+
+    obs.obs_source_release(source)
+    _last_applied_delay_ms[source_name] = delay_ms
+
+
+def _apply_video_delay(delay_ms):
+    delay_ms = max(0, int(delay_ms))
+    for source_name in settings_cache["video_sources"]:
+        _apply_delay_to_source(source_name, delay_ms)
+
+
 def _format_duration(seconds):
     seconds = max(0, int(seconds))
     days, rem = divmod(seconds, 86400)
@@ -192,6 +304,9 @@ def _process_queue():
             alltime_total = msg.get("alltime_total", 0)
             text = settings_cache["counter_format"].format(session=session_total, alltime=alltime_total)
             _set_text_source(settings_cache["counter_source"], text)
+
+            if settings_cache["auto_sync_delay"] and "delay_sec" in msg:
+                _apply_video_delay(msg["delay_sec"] * 1000)
 
         if msg_type == "censor_event":
             _last_swear_time = time.time()
