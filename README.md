@@ -55,6 +55,17 @@
 - Звук при цензуре
 - Таймер "без мата уже: ЧЧ:ММ:СС"
 
+## Как настроить?
+
+1. Скачай и установи VB-CABLE по кнопке в приложении или на официальном сайте: https://vb-audio.com/Cable/
+<img width="817" height="71" alt="image" src="https://github.com/user-attachments/assets/4e279385-4fc3-4a7e-877a-a20bb7c6ef4f" />
+
+2. В поле «Микрофон (вход)» выбери свой микрофон, а в поле «Выход (динамики / кабель)» выбери «Cable Input» (он может выбраться автоматически, если ты уже установил VB-CABLE)
+<img width="816" height="86" alt="image" src="https://github.com/user-attachments/assets/2551256e-cb66-4db9-837d-230d157bf76c" />
+
+3. В Discord, OBS или другой программе в качестве микрофона выбери «Cable Output» и отключи любое стороннее шумоподавление (например, как на картинке в Дискорде)
+<img width="358" height="172" alt="image" src="https://github.com/user-attachments/assets/a2060fb6-1944-44a0-9bdd-7dec41bc89e6" />
+
 ## Ограничения
 
 - Это эвристика, а не идеальный ИИ-классификатор — возможны ложные срабатывания и пропуски
