@@ -67,8 +67,6 @@ class App:
         self.root_words = list(self.saved.get("root_words", DEFAULT_ROOT_CORES))
         self.whitelist_words = list(self.saved.get("whitelist_words", []))
 
-        # Новый формат: список {"path": ..., "words": [...]}. Если в старых настройках
-        # остался плоский custom_beep_paths - мигрируем его в новый формат (words=[] = "любой мат").
         self.custom_sound_mappings = list(self.saved.get("custom_sound_mappings", []) or [])
         self.profiles = load_profiles()
         for old_path in self.saved.get("custom_beep_paths", []) or []:
@@ -156,7 +154,7 @@ class App:
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        main_tab = inner  # весь дальнейший код метода пакует виджеты внутрь прокручиваемого фрейма
+        main_tab = inner 
 
         frame = ttk.Frame(main_tab)
         frame.pack(fill="x", **pad)
