@@ -206,7 +206,6 @@ class SwearBeeperEngine:
         except Exception:
             pass
 
-        # Стандартный набор частот, которые почти всегда поддерживаются железом/драйверами
         for r in (PLAYBACK_RATE, 44100, 32000, 22050, 16000):
             if r not in candidates:
                 candidates.append(r)
@@ -216,7 +215,6 @@ class SwearBeeperEngine:
     def _load_sound_mappings(self):
         self.sound_mappings = []
 
-        # Новый формат: список {"path": ..., "words": [...]}  (words пусто = "любой мат")
         for entry in self.config.get("custom_sound_mappings", []) or []:
             path = entry.get("path")
             words = {normalize_word(w) for w in entry.get("words", []) if w.strip()}
@@ -228,7 +226,6 @@ class SwearBeeperEngine:
             except Exception as e:
                 self.log(f"Не удалось загрузить звук '{path}': {e}. Пропускаю.")
 
-        # Старый формат (плоский список путей) - для обратной совместимости со старыми настройками
         for path in self.config.get("custom_beep_paths", []) or []:
             try:
                 data = load_wav_mono_float(path, self.playback_rate)
@@ -266,7 +263,6 @@ class SwearBeeperEngine:
                 else:
                     self.log(f"Аудио-поток открыт на частоте {rate} Гц (запасной вариант №{i + 1}, предыдущие частоты не подошли).")
 
-                # Буфер и звуки создаём/грузим ПОСЛЕ того как узнали реально рабочую частоту
                 self._load_sound_mappings()
                 self.delay_buffer = DelayBuffer(self.playback_rate, self.config["delay_sec"])
                 return
@@ -311,7 +307,6 @@ class SwearBeeperEngine:
         if self.noise_profile is None or len(self.noise_profile) != len(mag):
             self.noise_profile = mag.copy()
         else:
-            # Медленно тянем профиль шума к "полу" сигнала (минимум с утечкой вверх/вниз)
             self.noise_profile = np.where(
                 mag < self.noise_profile,
                 0.85 * self.noise_profile + 0.15 * mag,
@@ -439,8 +434,6 @@ class SwearBeeperEngine:
                 tag = "OK" if ok else "ПОЗДНО"
                 self.log(f"[МАТ] '{word}' [{w['start']:.2f}s - {w['end']:.2f}s] -> цензура: {tag}")
 
-                # Считаем в статистику/журнал/OBS ВСЕГДА, даже если бип не успел (ПОЗДНО) -
-                # мат всё равно был сказан и распознан, это должно быть учтено.
                 self.stats["total"] += 1
                 self.stats["per_word"][word_normalized] = self.stats["per_word"].get(word_normalized, 0) + 1
                 if self.journal_callback:
