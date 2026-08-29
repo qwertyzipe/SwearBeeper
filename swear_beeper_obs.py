@@ -201,7 +201,7 @@ def _is_async_source(source):
         flags = obs.obs_source_get_output_flags(source)
         return bool(flags & obs.OBS_SOURCE_ASYNC)
     except Exception:
-        return True  # по умолчанию считаем async (веб-камера) - безопаснее для типичного случая
+        return True
 
 
 def _create_or_update_filter(source, filt_name, filter_id, delay_ms):
@@ -244,12 +244,9 @@ def _apply_delay_to_source(source_name, delay_ms):
         return
 
     if _is_async_source(source):
-        # Веб-камера / медиа-источник - обычный "Video Delay (Async)", без ограничения по мс
         _create_or_update_filter(source, VIDEO_DELAY_FILTER_NAME, "async_delay_filter", delay_ms)
         _cleanup_stacked_filters(source, keep_names=[])
     else:
-        # Захват экрана/окна/игры - "Render Delay", максимум 500мс на инстанс,
-        # поэтому при необходимости складываем несколько фильтров подряд.
         _remove_filter_if_exists(source, VIDEO_DELAY_FILTER_NAME)
 
         remaining = delay_ms
