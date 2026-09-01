@@ -71,6 +71,15 @@
 <img width="553" height="268" alt="capture_20260830_225809" src="https://github.com/user-attachments/assets/512fb122-c9d9-4308-8856-06ca794c57b2" />
 
 
+## Как подключить скрипт к OBS?
+
+Заходим в `Сервис (Т)` и нажимаем `Скрипты`
+Заходим в Настройки Python и указываем путь на Python 3.12 (64 битовую версию можно скачать [тут](https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe). Или 32 битовую [тут](https://www.python.org/ftp/python/3.12.10/python-3.12.10.exe)) Обычно путь таков: **C:/Users/ВашЮзер/AppData/Local/Programs/Python/Python312**
+Далее заходим в `Скрипты` и нажимаем на `+`
+Выбираем файл `swear_beeper_obs.py`
+Теперь настраиваем как написано в описании
+<img width="826" height="587" alt="image" src="https://github.com/user-attachments/assets/efd8c861-d5a7-4048-8b47-d60648dfefe1" />
+
 ## Ограничения
 
 - Это эвристика, а не идеальный ИИ-классификатор — возможны ложные срабатывания и пропуски
