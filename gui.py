@@ -7,7 +7,7 @@ import random
 import threading
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 
 import numpy as np
 import sounddevice as sd
@@ -26,9 +26,9 @@ except ImportError:
     KEYBOARD_AVAILABLE = False
 
 from config import (
-    PLAYBACK_RATE, BEEP_FREQ, DEFAULT_ROOT_CORES, VB_CABLE_URL,
+    PLAYBACK_RATE, BEEP_FREQ, DEFAULT_ROOT_CORES, VB_CABLE_URL, GITHUB_ISSUES_URL,
     DEFAULT_DELAY, DEFAULT_BEEP_VOLUME, DEFAULT_PAD_BEFORE, DEFAULT_PAD_AFTER,
-    DEFAULT_MIC_GAIN, DEFAULT_HOTKEY, OBS_BRIDGE_PORT,
+    DEFAULT_MIC_GAIN, DEFAULT_HOTKEY, OBS_BRIDGE_PORT, OBS_OVERLAY_PORT,
     SCANCODE_TO_ENGLISH_KEY, MODIFIER_KEY_NAMES, APP_VERSION,
     resource_path, load_settings, save_settings,
     append_journal_entry, load_journal, clear_journal_file,
@@ -37,6 +37,7 @@ from config import (
 from updater import parse_version, check_for_updates
 from single_instance import try_acquire_single_instance, signal_existing_instance
 from obs_bridge import ObsBridgeServer
+from overlay_server import OverlayServer
 from audio_engine import (
     normalize_word, build_swear_pattern, load_wav_mono_float,
     level_to_percent, SwearBeeperEngine,
@@ -106,6 +107,34 @@ class App:
         else:
             self._log(f"Не удалось запустить OBS-мост (перепробовал порты {OBS_BRIDGE_PORT}-{OBS_BRIDGE_PORT+9}, все заняты).")
 
+        self.overlay_server = OverlayServer(OBS_OVERLAY_PORT)
+        if self.overlay_server.start():
+            overlay_url = self.overlay_server.url()
+            if self.overlay_server.port != OBS_OVERLAY_PORT:
+                self._log(f"Веб-виджет для OBS запущен на {overlay_url} (порт {OBS_OVERLAY_PORT} был занят).")
+            else:
+                self._log(f"Веб-виджет для OBS запущен: {overlay_url}")
+            if hasattr(self, "overlay_link_var"):
+                self.overlay_link_var.set(overlay_url)
+            self.overlay_server.set_counter_label(self.saved.get("obs_counter_label", "Матов:"))
+            self.overlay_server.set_counter_colors(
+                label_color=self.saved.get("obs_counter_label_color", "#cfcfcf"),
+                value_color=self.saved.get("obs_counter_value_color", "#ff5b5b"),
+            )
+            self.overlay_server.set_timer_enabled(self.saved.get("obs_timer_enabled", True))
+            self.overlay_server.set_timer_format(self.saved.get("obs_timer_format", "Без мата: {time}"))
+            self.overlay_server.set_timer_color(self.saved.get("obs_timer_color", "#cfcfcf"))
+            saved_banner_image = self.saved.get("obs_banner_image_path")
+            if saved_banner_image and os.path.isfile(saved_banner_image):
+                try:
+                    self.overlay_server.set_banner_image(saved_banner_image)
+                except Exception as e:
+                    self._log(f"Не удалось восстановить картинку баннера '{saved_banner_image}': {e}")
+        else:
+            self._log(f"Не удалось запустить веб-виджет для OBS (перепробовал порты {OBS_OVERLAY_PORT}-{OBS_OVERLAY_PORT+9}, все заняты).")
+            if hasattr(self, "overlay_link_var"):
+                self.overlay_link_var.set("не удалось запустить")
+
         if not self.saved.get("onboarding_dismissed", False):
             self.root.after(300, self._show_onboarding)
 
@@ -154,7 +183,7 @@ class App:
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        main_tab = inner 
+        main_tab = inner  # весь дальнейший код метода пакует виджеты внутрь прокручиваемого фрейма
 
         frame = ttk.Frame(main_tab)
         frame.pack(fill="x", **pad)
@@ -182,6 +211,7 @@ class App:
         ttk.Button(frame, text="Обновить устройства", command=self._refresh_devices).grid(row=3, column=1, sticky="w", pady=(4, 4))
         ttk.Button(frame, text="Скачать VB-CABLE", command=self._open_vbcable).grid(row=3, column=2, sticky="w", pady=(4, 4))
         ttk.Button(frame, text="Проверить обновления", command=self._check_updates_clicked).grid(row=3, column=3, sticky="w", pady=(4, 4))
+        ttk.Button(frame, text="Нашёл баг? Создай Issue", command=self._open_github_issues).grid(row=4, column=1, sticky="w", pady=(4, 4))
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -247,10 +277,16 @@ class App:
         ttk.Label(mode_frame, text="Способ цензуры:").pack(side="left")
         self.censor_mode_var = tk.StringVar(value=self.saved.get("censor_mode", "beep"))
         ttk.Radiobutton(mode_frame, text="Бип/звук", variable=self.censor_mode_var, value="beep", command=self._autosave).pack(side="left", padx=(8, 4))
-        ttk.Radiobutton(mode_frame, text="Тишина (мьют)", variable=self.censor_mode_var, value="mute", command=self._autosave).pack(side="left")
+        ttk.Radiobutton(mode_frame, text="Тишина (мьют)", variable=self.censor_mode_var, value="mute", command=self._autosave).pack(side="left", padx=(0, 4))
+        ttk.Radiobutton(mode_frame, text="Инверсия (задом наперёд)", variable=self.censor_mode_var, value="reverse", command=self._autosave).pack(side="left")
         mode_info_icon = tk.Label(mode_frame, text="\u2753", fg="gray", cursor="question_arrow")
         mode_info_icon.pack(side="left", padx=(6, 0))
-        Tooltip(mode_info_icon, "Тишина - просто вырезает мат без звука вместо него. Полезно, если надоел звук бипа.")
+        Tooltip(
+            mode_info_icon,
+            "Тишина - просто вырезает мат без звука вместо него.\n"
+            "Инверсия - переворачивает само слово задом наперёд (эффект 'бэкмаскинга'), "
+            "смысл теряется, но факт речи остаётся слышен - забавнее, чем тупой бип.",
+        )
 
         noise_frame = ttk.Frame(main_tab)
         noise_frame.pack(fill="x", **pad)
@@ -313,6 +349,78 @@ class App:
             ttk.Label(hotkey_frame, text="(модуль 'keyboard' не установлен — хоткей недоступен)", foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w")
         else:
             ttk.Label(hotkey_frame, text="Нажми 'Записать', затем зажми нужную комбинацию клавиш", foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w")
+
+        ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
+
+        overlay_frame = ttk.Frame(main_tab)
+        overlay_frame.pack(fill="x", **pad)
+        ttk.Label(overlay_frame, text="Веб-виджет для OBS:").grid(row=0, column=0, columnspan=4, sticky="w")
+        self.overlay_link_var = tk.StringVar(value="запускается...")
+        overlay_entry = ttk.Entry(overlay_frame, textvariable=self.overlay_link_var, width=42, state="readonly")
+        overlay_entry.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 0))
+        ttk.Button(overlay_frame, text="Скопировать ссылку", command=self._copy_overlay_link).grid(row=1, column=2, padx=(6, 0), pady=(2, 0))
+        ttk.Button(overlay_frame, text="Открыть в браузере", command=self._open_overlay_link).grid(row=1, column=3, padx=(6, 0), pady=(2, 0))
+        overlay_info_icon = tk.Label(overlay_frame, text="\u2753", fg="gray", cursor="question_arrow")
+        overlay_info_icon.grid(row=1, column=4, sticky="w", padx=(6, 0))
+        Tooltip(
+            overlay_info_icon,
+            "В OBS: Источники -> + -> Браузер -> вставь эту ссылку в поле URL.",
+        )
+
+        ttk.Label(overlay_frame, text="— Счётчик матов —", foreground="gray").grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        ttk.Label(overlay_frame, text="Текст счётчика:").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.overlay_counter_label_var = tk.StringVar(value=self.saved.get("obs_counter_label", "Матов:"))
+        self.overlay_counter_label_var.trace_add("write", self._on_counter_label_changed)
+        ttk.Entry(overlay_frame, textvariable=self.overlay_counter_label_var, width=24).grid(row=3, column=1, sticky="w", pady=(4, 0))
+
+        ttk.Label(overlay_frame, text="Цвет текста:").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        self.overlay_counter_label_color_var = tk.StringVar(value=self.saved.get("obs_counter_label_color", "#cfcfcf"))
+        self.overlay_counter_label_color_swatch = tk.Label(overlay_frame, text="  ", background=self.overlay_counter_label_color_var.get(), relief="sunken", width=4)
+        self.overlay_counter_label_color_swatch.grid(row=4, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(overlay_frame, text="Выбрать цвет...", command=self._choose_counter_label_color).grid(row=4, column=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(overlay_frame, text="Цвет числа:").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        self.overlay_counter_value_color_var = tk.StringVar(value=self.saved.get("obs_counter_value_color", "#ff5b5b"))
+        self.overlay_counter_value_color_swatch = tk.Label(overlay_frame, text="  ", background=self.overlay_counter_value_color_var.get(), relief="sunken", width=4)
+        self.overlay_counter_value_color_swatch.grid(row=5, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(overlay_frame, text="Выбрать цвет...", command=self._choose_counter_value_color).grid(row=5, column=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(overlay_frame, text="— Таймер «без мата» —", foreground="gray").grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        self.overlay_timer_enabled_var = tk.BooleanVar(value=self.saved.get("obs_timer_enabled", True))
+        ttk.Checkbutton(overlay_frame, text="Показывать таймер", variable=self.overlay_timer_enabled_var, command=self._on_timer_enabled_toggle).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(overlay_frame, text="Формат таймера:").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        self.overlay_timer_format_var = tk.StringVar(value=self.saved.get("obs_timer_format", "Без мата: {time}"))
+        self.overlay_timer_format_var.trace_add("write", self._on_timer_format_changed)
+        ttk.Entry(overlay_frame, textvariable=self.overlay_timer_format_var, width=28).grid(row=8, column=1, sticky="w", pady=(4, 0))
+        timer_format_icon = tk.Label(overlay_frame, text="\u2753", fg="gray", cursor="question_arrow")
+        timer_format_icon.grid(row=8, column=2, sticky="w", padx=(4, 0))
+        Tooltip(timer_format_icon, "{time} подставится как ЧЧ:ММ:СС (или 'Xд ЧЧ:ММ:СС' если больше суток).\nОтсчёт идёт от последнего запиканного мата (или от запуска, если мата ещё не было).")
+
+        ttk.Label(overlay_frame, text="Цвет таймера:").grid(row=9, column=0, sticky="w", pady=(4, 0))
+        self.overlay_timer_color_var = tk.StringVar(value=self.saved.get("obs_timer_color", "#cfcfcf"))
+        self.overlay_timer_color_swatch = tk.Label(overlay_frame, text="  ", background=self.overlay_timer_color_var.get(), relief="sunken", width=4)
+        self.overlay_timer_color_swatch.grid(row=9, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(overlay_frame, text="Выбрать цвет...", command=self._choose_timer_color).grid(row=9, column=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(overlay_frame, text="— Баннер при мате —", foreground="gray").grid(row=10, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        ttk.Label(overlay_frame, text="Картинка баннера:").grid(row=11, column=0, sticky="w", pady=(4, 0))
+        self.overlay_banner_image_var = tk.StringVar(value=self.saved.get("obs_banner_image_path") or "(не выбрана — баннер не показывается)")
+        ttk.Entry(overlay_frame, textvariable=self.overlay_banner_image_var, width=42, state="readonly").grid(row=11, column=1, columnspan=2, sticky="we", pady=(4, 0))
+        ttk.Button(overlay_frame, text="Выбрать картинку...", command=self._choose_banner_image).grid(row=12, column=1, sticky="w", pady=(2, 0))
+        ttk.Button(overlay_frame, text="Сбросить", command=self._reset_banner_image).grid(row=12, column=2, sticky="w", pady=(2, 0))
+        ttk.Button(overlay_frame, text="Показать тест баннера", command=self._test_banner).grid(row=12, column=3, sticky="w", pady=(2, 0))
+        banner_info_icon = tk.Label(overlay_frame, text="\u2753", fg="gray", cursor="question_arrow")
+        banner_info_icon.grid(row=12, column=4, sticky="w", padx=(6, 0))
+        Tooltip(
+            banner_info_icon,
+            "Баннер при мате - это картинка или гифка, которую ты сам выбираешь.\n"
+            "Пока картинка не выбрана - баннер вообще не показывается, только счётчик и таймер.",
+        )
+
 
         ttk.Separator(main_tab, orient="horizontal").pack(fill="x", pady=6)
 
@@ -631,8 +739,108 @@ class App:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось воспроизвести звук: {e}")
 
+    def _open_github_issues(self):
+        webbrowser.open(GITHUB_ISSUES_URL)
+
     def _open_vbcable(self):
         webbrowser.open(VB_CABLE_URL)
+
+    def _copy_overlay_link(self):
+        url = self.overlay_link_var.get()
+        if not url or url in ("запускается...", "не удалось запустить"):
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self._log("Ссылка на веб-виджет скопирована в буфер обмена.")
+
+    def _open_overlay_link(self):
+        url = self.overlay_link_var.get()
+        if not url or url in ("запускается...", "не удалось запустить"):
+            messagebox.showerror("Ошибка", "Веб-виджет ещё не запущен.")
+            return
+        webbrowser.open(url)
+
+    def _on_counter_label_changed(self, *args):
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_counter_label(self.overlay_counter_label_var.get())
+        self._autosave()
+
+    def _choose_counter_label_color(self):
+        _, hex_color = colorchooser.askcolor(
+            color=self.overlay_counter_label_color_var.get(), title="Цвет текста счётчика",
+        )
+        if not hex_color:
+            return
+        self.overlay_counter_label_color_var.set(hex_color)
+        self.overlay_counter_label_color_swatch.config(background=hex_color)
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_counter_colors(label_color=hex_color)
+        self._autosave()
+
+    def _choose_counter_value_color(self):
+        _, hex_color = colorchooser.askcolor(
+            color=self.overlay_counter_value_color_var.get(), title="Цвет числа счётчика",
+        )
+        if not hex_color:
+            return
+        self.overlay_counter_value_color_var.set(hex_color)
+        self.overlay_counter_value_color_swatch.config(background=hex_color)
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_counter_colors(value_color=hex_color)
+        self._autosave()
+
+    def _on_timer_enabled_toggle(self):
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_timer_enabled(self.overlay_timer_enabled_var.get())
+        self._autosave()
+
+    def _on_timer_format_changed(self, *args):
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_timer_format(self.overlay_timer_format_var.get())
+        self._autosave()
+
+    def _choose_timer_color(self):
+        _, hex_color = colorchooser.askcolor(
+            color=self.overlay_timer_color_var.get(), title="Цвет таймера",
+        )
+        if not hex_color:
+            return
+        self.overlay_timer_color_var.set(hex_color)
+        self.overlay_timer_color_swatch.config(background=hex_color)
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_timer_color(hex_color)
+        self._autosave()
+
+    def _choose_banner_image(self):
+        path = filedialog.askopenfilename(
+            title="Выбери картинку для баннера",
+            filetypes=[("Изображения", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            if getattr(self, "overlay_server", None):
+                self.overlay_server.set_banner_image(path)
+            self.overlay_banner_image_var.set(path)
+            self._autosave()
+            self._log(f"Картинка баннера установлена: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось загрузить картинку: {e}")
+
+    def _reset_banner_image(self):
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.clear_banner_image()
+        self.overlay_banner_image_var.set("(не выбрана — баннер не показывается)")
+        self._autosave()
+
+    def _test_banner(self):
+        if not getattr(self, "overlay_server", None):
+            return
+        if not self.overlay_server.get_state().get("has_image"):
+            messagebox.showinfo("Инфо", "Сначала выбери картинку баннера кнопкой 'Выбрать картинку...' — иначе показывать нечего.")
+            return
+        self.overlay_server.notify_censor_event()
+        self._log("Тестовый показ баннера отправлен на оверлей — глянь в OBS/браузере, где он появился.")
 
     def _check_updates_on_startup(self):
         def worker():
@@ -1014,14 +1222,18 @@ class App:
         timestamp = append_journal_entry(word)
         self.journal_queue.put((timestamp, word))
 
-        if getattr(self, "obs_bridge", None):
+        if getattr(self, "obs_bridge", None) or getattr(self, "overlay_server", None):
             session_total, alltime_total = self._get_current_totals()
-            self.obs_bridge.broadcast({
-                "type": "censor_event",
-                "session_total": session_total,
-                "alltime_total": alltime_total,
-                "ts": timestamp,
-            })
+            if getattr(self, "obs_bridge", None):
+                self.obs_bridge.broadcast({
+                    "type": "censor_event",
+                    "session_total": session_total,
+                    "alltime_total": alltime_total,
+                    "ts": timestamp,
+                })
+            if getattr(self, "overlay_server", None):
+                self.overlay_server.update_snapshot(session_total, alltime_total)
+                self.overlay_server.notify_censor_event(word, timestamp)
 
     def _log(self, message):
         self.log_queue.put(message)
@@ -1086,6 +1298,9 @@ class App:
                 "delay_sec": self.delay_var.get(),
             })
 
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.update_snapshot(session_total, alltime_total_display, self.delay_var.get())
+
         self.root.after(1000, self._poll_stats)
 
     def _commit_session_stats_to_alltime(self):
@@ -1134,45 +1349,205 @@ class App:
             "output_device_name": self._parse_device_name(self.output_device_var.get()) if self.output_device_var.get() else None,
             "test_output_device_name": self._parse_device_name(self.test_output_device_var.get()) if self.test_output_device_var.get() else None,
             "onboarding_dismissed": self.saved.get("onboarding_dismissed", False),
+            "obs_counter_label": self.overlay_counter_label_var.get() if hasattr(self, "overlay_counter_label_var") else "Матов:",
+            "obs_counter_label_color": self.overlay_counter_label_color_var.get() if hasattr(self, "overlay_counter_label_color_var") else "#cfcfcf",
+            "obs_counter_value_color": self.overlay_counter_value_color_var.get() if hasattr(self, "overlay_counter_value_color_var") else "#ff5b5b",
+            "obs_timer_enabled": self.overlay_timer_enabled_var.get() if hasattr(self, "overlay_timer_enabled_var") else True,
+            "obs_timer_format": self.overlay_timer_format_var.get() if hasattr(self, "overlay_timer_format_var") else "Без мата: {time}",
+            "obs_timer_color": self.overlay_timer_color_var.get() if hasattr(self, "overlay_timer_color_var") else "#cfcfcf",
+            "obs_banner_image_path": (
+                self.overlay_banner_image_var.get()
+                if hasattr(self, "overlay_banner_image_var") and os.path.isfile(self.overlay_banner_image_var.get())
+                else None
+            ),
         }
 
     def _show_onboarding(self):
-        win = tk.Toplevel(self.root)
-        win.title("Быстрый старт")
-        win.geometry("560x520")
-        win.minsize(480, 420)
-        win.maxsize(800, 700)
-        win.transient(self.root)
-        win.grab_set()
+        self.wizard_step = 0
+        self.wizard_win = tk.Toplevel(self.root)
+        self.wizard_win.title("Быстрая настройка Swear Beeper")
+        self.wizard_win.geometry("560x480")
+        self.wizard_win.minsize(500, 420)
+        self.wizard_win.maxsize(800, 700)
+        self.wizard_win.transient(self.root)
+        self.wizard_win.grab_set()
+        self.wizard_win.protocol("WM_DELETE_WINDOW", self._finish_wizard)
 
-        text = (
-            "Добро пожаловать в Swear Beeper!\n\n"
-            "Чтобы всё заработало правильно:\n\n"
-            "1. Скачай и установи VB-CABLE (кнопка 'Скачать VB-CABLE' на главном экране)\n"
-            "   — понадобится перезагрузка компьютера после установки.\n\n"
-            "2. На главном экране в поле 'Микрофон (вход)' выбери СВОЙ настоящий физический микрофон.\n\n"
-            "3. В поле 'Выход (динамики / кабель)' выбери 'CABLE Input'\n"
-            "   — именно туда приложение будет отправлять уже очищенный звук.\n\n"
-            "4. В Discord (или другой программе) в качестве микрофона выбери 'CABLE Output'.\n\n"
-            "5. Перед стартом можешь проверить всё через кнопку 'Тест микрофона' —\n"
-            "   там отдельно выбирается выход (твои настоящие наушники/колонки), чтобы услышать результат.\n\n"
-            "Подробности и troubleshooting — в README на GitHub."
-        )
+        self.wizard_content = ttk.Frame(self.wizard_win)
+        self.wizard_content.pack(fill="both", expand=True, padx=16, pady=16)
 
-        label = tk.Label(win, text=text, justify="left", anchor="w", padx=12, pady=12, wraplength=450)
-        label.pack(fill="both", expand=True)
+        self.wizard_nav = ttk.Frame(self.wizard_win)
+        self.wizard_nav.pack(fill="x", padx=16, pady=(0, 16))
 
-        dont_show_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(win, text="Больше не показывать", variable=dont_show_var).pack(anchor="w", padx=12)
+        self._render_wizard_step()
 
-        def close():
-            if dont_show_var.get():
-                self.saved["onboarding_dismissed"] = True
-                self._autosave()
-            win.destroy()
+    def _clear_wizard_content(self):
+        for widget in self.wizard_content.winfo_children():
+            widget.destroy()
+        for widget in self.wizard_nav.winfo_children():
+            widget.destroy()
 
-        ttk.Button(win, text="Понятно, поехали", command=close).pack(pady=10)
-        win.protocol("WM_DELETE_WINDOW", close)
+    def _render_wizard_step(self):
+        self._clear_wizard_content()
+        steps = [
+            self._wizard_step_welcome,
+            self._wizard_step_vbcable,
+            self._wizard_step_devices,
+            self._wizard_step_test,
+        ]
+        steps[self.wizard_step]()
+
+    def _wizard_next(self):
+        self.wizard_step += 1
+        self._render_wizard_step()
+
+    def _wizard_step_welcome(self):
+        ttk.Label(
+            self.wizard_content,
+            text="Добро пожаловать в Swear Beeper! 👋",
+            font=("", 13, "bold"),
+        ).pack(anchor="w", pady=(0, 12))
+        ttk.Label(
+            self.wizard_content,
+            text=(
+                "Сейчас за 3 коротких шага настроим всё, что нужно:\n\n"
+                "1. Проверим/поставим VB-CABLE (виртуальный микрофон для Discord/OBS)\n"
+                "2. Автоматически подберём микрофон и выход\n"
+                "3. Проверим, что всё реально работает\n\n"
+                "Ничего вручную искать в настройках не придётся — только пара кликов."
+            ),
+            justify="left", wraplength=500,
+        ).pack(anchor="w", fill="both", expand=True)
+
+        ttk.Button(self.wizard_nav, text="Начать настройку →", command=self._wizard_next).pack(side="right")
+        ttk.Button(self.wizard_nav, text="Пропустить, я сам разберусь", command=self._finish_wizard).pack(side="left")
+
+    def _wizard_step_vbcable(self):
+        has_cable = self._detect_vb_cable()
+
+        ttk.Label(self.wizard_content, text="Шаг 1 из 3: VB-CABLE", font=("", 13, "bold")).pack(anchor="w", pady=(0, 12))
+
+        if has_cable:
+            ttk.Label(
+                self.wizard_content,
+                text="✅ VB-CABLE уже установлен и найден в системе — этот шаг можно пропустить.",
+                foreground="green", justify="left", wraplength=500,
+            ).pack(anchor="w", pady=(0, 12))
+        else:
+            ttk.Label(
+                self.wizard_content,
+                text=(
+                    "VB-CABLE не найден. Это бесплатная программа, которая создаёт 'виртуальный микрофон' — "
+                    "через неё Discord/OBS будут слышать уже очищенный от мата звук.\n\n"
+                    "1. Нажми кнопку ниже — откроется официальный сайт\n"
+                    "2. Скачай и установи (потребуется перезагрузка компьютера)\n"
+                    "3. После перезагрузки вернись сюда и нажми 'Проверить снова'"
+                ),
+                justify="left", wraplength=500,
+            ).pack(anchor="w", pady=(0, 12))
+
+            btn_row = ttk.Frame(self.wizard_content)
+            btn_row.pack(anchor="w", pady=(0, 8))
+            ttk.Button(btn_row, text="Скачать VB-CABLE", command=self._open_vbcable).pack(side="left", padx=(0, 8))
+            ttk.Button(btn_row, text="Проверить снова", command=self._render_wizard_step).pack(side="left")
+
+        ttk.Button(self.wizard_nav, text="Далее →", command=self._wizard_next).pack(side="right")
+        ttk.Button(self.wizard_nav, text="Пропустить этот шаг", command=self._wizard_next).pack(side="left")
+
+    def _detect_vb_cable(self):
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return False
+        return any("cable" in d.get("name", "").lower() for d in devices)
+
+    def _wizard_step_devices(self):
+        self._refresh_devices()
+
+        ttk.Label(self.wizard_content, text="Шаг 2 из 3: устройства", font=("", 13, "bold")).pack(anchor="w", pady=(0, 12))
+        ttk.Label(
+            self.wizard_content,
+            text="Подобрал автоматически — если что-то не так, поменяешь на главном экране в любой момент.",
+            justify="left", wraplength=500,
+        ).pack(anchor="w", pady=(0, 12))
+
+        summary_frame = ttk.Frame(self.wizard_content)
+        summary_frame.pack(anchor="w", fill="x", pady=(0, 8))
+
+        def add_row(row, label, value, ok):
+            ttk.Label(summary_frame, text=label, font=("", 10, "bold")).grid(row=row, column=0, sticky="w", pady=3)
+            mark = "✅" if ok else "⚠️"
+            ttk.Label(summary_frame, text=f"{mark} {value}").grid(row=row, column=1, sticky="w", padx=(8, 0))
+
+        mic_value = self.input_device_var.get() or "не найден"
+        output_value = self.output_device_var.get() or "не найден"
+        test_value = self.test_output_device_var.get() or "не найден"
+
+        add_row(0, "Микрофон:", mic_value, bool(self.input_device_var.get()))
+        add_row(1, "Выход (в Discord/OBS):", output_value, "cable" in output_value.lower())
+        add_row(2, "Выход для теста (твои уши):", test_value, bool(self.test_output_device_var.get()))
+
+        if "cable" not in output_value.lower():
+            ttk.Label(
+                self.wizard_content,
+                text="⚠️ CABLE Input не выбран автоматически — если только что установил VB-CABLE, "
+                     "нажми 'Обновить' или вернись на предыдущий шаг после перезагрузки компьютера.",
+                foreground="#a06000", justify="left", wraplength=500,
+            ).pack(anchor="w", pady=(8, 0))
+            ttk.Button(self.wizard_content, text="Обновить список устройств", command=self._wizard_refresh_devices_step).pack(anchor="w", pady=(6, 0))
+
+        ttk.Button(self.wizard_nav, text="Далее →", command=self._wizard_next).pack(side="right")
+        ttk.Button(self.wizard_nav, text="← Назад", command=self._wizard_back).pack(side="left")
+
+    def _wizard_refresh_devices_step(self):
+        self.input_device_var.set("")
+        self.output_device_var.set("")
+        self.test_output_device_var.set("")
+        self._render_wizard_step()
+
+    def _wizard_back(self):
+        self.wizard_step -= 1
+        self._render_wizard_step()
+
+    def _wizard_step_test(self):
+        ttk.Label(self.wizard_content, text="Шаг 3 из 3: проверка", font=("", 13, "bold")).pack(anchor="w", pady=(0, 12))
+        ttk.Label(
+            self.wizard_content,
+            text=(
+                "Нажми кнопку ниже и скажи что-нибудь с матом вслух — если всё настроено верно, "
+                "услышишь через свои наушники/колонки, что слово запикано.\n\n"
+                "(Это тот же тест, что доступен на главном экране в любой момент)"
+            ),
+            justify="left", wraplength=500,
+        ).pack(anchor="w", pady=(0, 12))
+
+        self.wizard_test_btn = ttk.Button(self.wizard_content, text="▶ Проверить микрофон", command=self._wizard_toggle_test)
+        self.wizard_test_btn.pack(anchor="w", pady=(0, 12))
+
+        ttk.Label(
+            self.wizard_content,
+            text="Готово? Жми 'Завершить' — эта настройка больше не появится при следующих запусках.",
+            justify="left", wraplength=500, foreground="gray",
+        ).pack(anchor="w", side="bottom")
+
+        ttk.Button(self.wizard_nav, text="Завершить ✓", command=self._finish_wizard).pack(side="right")
+        ttk.Button(self.wizard_nav, text="← Назад", command=self._wizard_back).pack(side="left")
+
+    def _wizard_toggle_test(self):
+        self._toggle_mic_test()
+        if self.mic_test_engine and self.mic_test_engine.running:
+            self.wizard_test_btn.config(text="■ Остановить проверку")
+        else:
+            self.wizard_test_btn.config(text="▶ Проверить микрофон")
+
+    def _finish_wizard(self):
+        if getattr(self, "mic_test_engine", None) and self.mic_test_engine.running:
+            self.mic_test_engine.stop()
+            self.mic_test_engine = None
+        self.saved["onboarding_dismissed"] = True
+        self._autosave()
+        if getattr(self, "wizard_win", None):
+            self.wizard_win.destroy()
 
     def _autosave(self, *args):
         if getattr(self, "_suppress_autosave", False):
@@ -1302,6 +1677,8 @@ class App:
                 pass
         if getattr(self, "obs_bridge", None):
             self.obs_bridge.stop()
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.stop()
         self.root.destroy()
         sys.exit(0)
 
