@@ -134,6 +134,43 @@ class DelayBuffer:
                 self.buffer[:end_idx - self.capacity] = beep[first:]
             return True
 
+    def stamp_reverse(self, global_start_sample, global_end_sample, fade_samples=0):
+        with self.lock:
+            if global_end_sample <= self.read_pos:
+                return False
+
+            start = max(global_start_sample, self.read_pos)
+            end = min(global_end_sample, self.write_pos)
+            if end <= start:
+                return False
+
+            n = end - start
+            offset_from_read = start - self.read_pos
+            idx = (self._r + offset_from_read) % self.capacity
+            end_idx = idx + n
+
+            if end_idx <= self.capacity:
+                segment = self.buffer[idx:end_idx].copy()
+            else:
+                first = self.capacity - idx
+                segment = np.concatenate([self.buffer[idx:].copy(), self.buffer[:end_idx - self.capacity].copy()])
+
+            reversed_segment = segment[::-1].copy()
+
+            fade = min(fade_samples, n // 2)
+            if fade > 0:
+                ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                reversed_segment[:fade] *= ramp
+                reversed_segment[-fade:] *= ramp[::-1]
+
+            if end_idx <= self.capacity:
+                self.buffer[idx:end_idx] = reversed_segment
+            else:
+                first = self.capacity - idx
+                self.buffer[idx:] = reversed_segment[:first]
+                self.buffer[:end_idx - self.capacity] = reversed_segment[first:]
+            return True
+
 
 class SwearBeeperEngine:
     def __init__(self, config, log_callback, journal_callback=None, crash_callback=None):
@@ -293,8 +330,6 @@ class SwearBeeperEngine:
         self.log("Остановлено.")
 
     def _apply_noise_suppression(self, mono):
-        """Простой спектральный шумодав (spectral gating) на FFT, без внешних библиотек.
-        Постоянно отслеживает 'пол' шума по спектру и вычитает его с небольшим запасом (oversubtraction)."""
         n = len(mono)
         if n < 4:
             return mono
@@ -396,8 +431,6 @@ class SwearBeeperEngine:
         return np.zeros(len(positions), dtype=np.float32)
 
     def _pick_sound_for_word(self, word_normalized):
-        """Возвращает np.array звука для конкретного слова: сначала ищем специфичный
-        маппинг (слово -> конкретные звуки), если нет - берём любой 'общий' звук (без слов)."""
         specific = [arr for (words, arr) in self.sound_mappings if words and word_normalized in words]
         if specific:
             return random.choice(specific)
@@ -421,16 +454,19 @@ class SwearBeeperEngine:
                 end_sample = int((w["end"] + self.config["pad_after"]) * self.playback_rate)
                 start_sample = max(0, start_sample)
 
-                if censor_mode == "mute":
+                if censor_mode == "reverse":
+                    fade_samples = max(1, int(0.005 * self.playback_rate))  # ~5мс фейд от щелчков
+                    ok = self.delay_buffer.stamp_reverse(start_sample, end_sample, fade_samples=fade_samples)
+                elif censor_mode == "mute":
                     seg_fn = self._mute_segment
+                    ok = self.delay_buffer.stamp_beep(start_sample, end_sample, seg_fn)
                 else:
                     chosen_sound = self._pick_sound_for_word(word_normalized)
                     if chosen_sound is not None:
                         seg_fn = lambda positions, os_=start_sample, snd=chosen_sound: self._beep_segment_custom(positions, os_, snd)
                     else:
                         seg_fn = self._beep_segment_sine
-
-                ok = self.delay_buffer.stamp_beep(start_sample, end_sample, seg_fn)
+                    ok = self.delay_buffer.stamp_beep(start_sample, end_sample, seg_fn)
                 tag = "OK" if ok else "ПОЗДНО"
                 self.log(f"[МАТ] '{word}' [{w['start']:.2f}s - {w['end']:.2f}s] -> цензура: {tag}")
 

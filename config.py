@@ -37,6 +37,7 @@ DEFAULT_ROOT_CORES = [
 PREFIXES = ["", "по", "на", "рас", "раз", "разъ", "за", "вы", "от", "отъ", "у", "пере", "под", "подъ", "до", "при", "об", "объ", "недо", "съ"]
 
 VB_CABLE_URL = "https://vb-audio.com/Cable/"
+GITHUB_ISSUES_URL = "https://github.com/qwertyzipe/SwearBeeper/issues"
 SETTINGS_FILENAME = "swear_beeper_settings.json"
 JOURNAL_FILENAME = "swear_beeper_journal.log"
 PROFILES_FILENAME = "swear_beeper_profiles.json"
@@ -49,6 +50,7 @@ DEFAULT_MIC_GAIN = 1.0
 DEFAULT_HOTKEY = "ctrl+alt+m"
 SINGLE_INSTANCE_PORT = 47821
 OBS_BRIDGE_PORT = 47823
+OBS_OVERLAY_PORT = 47824
 
 SCANCODE_TO_ENGLISH_KEY = {
     30: "a", 48: "b", 46: "c", 32: "d", 18: "e", 33: "f", 34: "g", 35: "h",
@@ -67,7 +69,7 @@ MODIFIER_KEY_NAMES = {
     "windows": {"windows", "left windows", "right windows"},
 }
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
 GITHUB_REPO = "qwertyzipe/SwearBeeper"
 
 
@@ -170,4 +172,3 @@ def save_profiles(data):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-
