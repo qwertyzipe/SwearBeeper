@@ -135,6 +135,11 @@ class DelayBuffer:
             return True
 
     def stamp_reverse(self, global_start_sample, global_end_sample, fade_samples=0):
+        """Переворачивает задом наперёд кусок буфера [start, end) — эффект 'бэкмаскинга'.
+        В отличие от stamp_beep, ничего не генерирует заново: сам мат уже лежит в буфере
+        (он ещё не воспроизведён из-за задержки), мы просто разворачиваем его сэмплы.
+        fade_samples — короткий линейный фейд на границах перевёрнутого куска, чтобы не
+        было щелчка на стыке с обычной (неперевёрнутой) речью до и после."""
         with self.lock:
             if global_end_sample <= self.read_pos:
                 return False
@@ -173,11 +178,12 @@ class DelayBuffer:
 
 
 class SwearBeeperEngine:
-    def __init__(self, config, log_callback, journal_callback=None, crash_callback=None):
+    def __init__(self, config, log_callback, journal_callback=None, crash_callback=None, event_callback=None):
         self.config = config
         self.log = log_callback
         self.journal_callback = journal_callback
         self.crash_callback = crash_callback
+        self.event_callback = event_callback
         self.crashed = False
         self.running = False
         self.model = None
@@ -292,6 +298,10 @@ class SwearBeeperEngine:
                     blocksize=blocksize, callback=self._audio_out_callback,
                     device=self.config["output_device"], latency="high",
                 )
+
+                self._load_sound_mappings()
+                self.delay_buffer = DelayBuffer(self.playback_rate, self.config["delay_sec"])
+
                 self.input_stream.start()
                 self.output_stream.start()
 
@@ -300,8 +310,6 @@ class SwearBeeperEngine:
                 else:
                     self.log(f"Аудио-поток открыт на частоте {rate} Гц (запасной вариант №{i + 1}, предыдущие частоты не подошли).")
 
-                self._load_sound_mappings()
-                self.delay_buffer = DelayBuffer(self.playback_rate, self.config["delay_sec"])
                 return
 
             except Exception as e:
@@ -315,6 +323,7 @@ class SwearBeeperEngine:
                             pass
                 self.input_stream = None
                 self.output_stream = None
+                self.delay_buffer = None
                 self.log(f"Частота {rate} Гц не подошла ({e}), пробую следующий вариант...")
 
         raise last_exception if last_exception else RuntimeError("Не удалось открыть аудио-поток ни на одной из частот.")
@@ -330,6 +339,8 @@ class SwearBeeperEngine:
         self.log("Остановлено.")
 
     def _apply_noise_suppression(self, mono):
+        """Простой спектральный шумодав (spectral gating) на FFT, без внешних библиотек.
+        Постоянно отслеживает 'пол' шума по спектру и вычитает его с небольшим запасом (oversubtraction)."""
         n = len(mono)
         if n < 4:
             return mono
@@ -355,7 +366,7 @@ class SwearBeeperEngine:
         return np.clip(cleaned, -1.0, 1.0)
 
     def _audio_in_callback(self, indata, frames, time_info, status):
-        if self.crashed:
+        if self.crashed or self.delay_buffer is None:
             return
         try:
             if status:
@@ -374,7 +385,7 @@ class SwearBeeperEngine:
             self._handle_crash(e)
 
     def _audio_out_callback(self, outdata, frames, time_info, status):
-        if self.crashed or self.manual_mute:
+        if self.crashed or self.manual_mute or self.delay_buffer is None:
             outdata[:, 0] = 0
             return
         try:
@@ -408,7 +419,7 @@ class SwearBeeperEngine:
                     self._partial_processed_count = 0
                 else:
                     partial = json.loads(self.recognizer.PartialResult())
-                    words = partial.get("result", [])
+                    words = partial.get("partial_result", [])
                     if len(words) > self._partial_processed_count:
                         new_words = words[self._partial_processed_count:]
                         self._process_words(new_words)
@@ -431,6 +442,8 @@ class SwearBeeperEngine:
         return np.zeros(len(positions), dtype=np.float32)
 
     def _pick_sound_for_word(self, word_normalized):
+        """Возвращает np.array звука для конкретного слова: сначала ищем специфичный
+        маппинг (слово -> конкретные звуки), если нет - берём любой 'общий' звук (без слов)."""
         specific = [arr for (words, arr) in self.sound_mappings if words and word_normalized in words]
         if specific:
             return random.choice(specific)
@@ -455,7 +468,7 @@ class SwearBeeperEngine:
                 start_sample = max(0, start_sample)
 
                 if censor_mode == "reverse":
-                    fade_samples = max(1, int(0.005 * self.playback_rate))  # ~5мс фейд от щелчков
+                    fade_samples = max(1, int(0.005 * self.playback_rate))
                     ok = self.delay_buffer.stamp_reverse(start_sample, end_sample, fade_samples=fade_samples)
                 elif censor_mode == "mute":
                     seg_fn = self._mute_segment
@@ -474,3 +487,6 @@ class SwearBeeperEngine:
                 self.stats["per_word"][word_normalized] = self.stats["per_word"].get(word_normalized, 0) + 1
                 if self.journal_callback:
                     self.journal_callback(word_normalized)
+                if self.event_callback:
+                    delay_sec = max(0.0, self.config.get("delay_sec", 0.0))
+                    threading.Timer(delay_sec, self.event_callback, args=(word_normalized, w["start"], w["end"])).start()

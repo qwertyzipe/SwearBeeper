@@ -19,15 +19,23 @@ OVERLAY_HTML = """<!doctype html>
     font-family: "Segoe UI", "Arial", sans-serif;
   }
 
-  #counter {
+  #widgetStack {
     position: fixed;
     left: 24px;
-    bottom: 54px;
+    bottom: 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  #counter {
     font-size: 22px;
     font-weight: 700;
     text-shadow: 0 0 6px rgba(0, 0, 0, 0.85), 0 1px 3px rgba(0, 0, 0, 0.9);
     transition: transform 0.15s ease-out;
     transform-origin: left bottom;
+    white-space: nowrap;
   }
 
   #counter.pulse {
@@ -40,12 +48,10 @@ OVERLAY_HTML = """<!doctype html>
   }
 
   #timer {
-    position: fixed;
-    left: 24px;
-    bottom: 24px;
     font-size: 16px;
     font-weight: 600;
     text-shadow: 0 0 6px rgba(0, 0, 0, 0.85), 0 1px 3px rgba(0, 0, 0, 0.9);
+    white-space: nowrap;
   }
 
   #banner {
@@ -66,6 +72,17 @@ OVERLAY_HTML = """<!doctype html>
     max-height: 360px;
     border-radius: 14px;
     box-shadow: 0 0 40px rgba(0, 0, 0, 0.55);
+  }
+
+  #eventText {
+    position: fixed;
+    top: 12%;
+    left: 50%;
+    transform: translateX(-50%);
+    display: none;
+    font-weight: 700;
+    text-shadow: 0 0 6px rgba(0, 0, 0, 0.85), 0 1px 3px rgba(0, 0, 0, 0.9);
+    white-space: nowrap;
   }
 
   #banner.show {
@@ -99,6 +116,7 @@ OVERLAY_HTML = """<!doctype html>
   <div id="banner">
     <img id="bannerImg" alt="">
   </div>
+  <div id="eventText"></div>
   <div id="offline"></div>
 
 <script>
@@ -110,9 +128,11 @@ OVERLAY_HTML = """<!doctype html>
   var timerTextEl = document.getElementById("timerText");
   var bannerEl = document.getElementById("banner");
   var bannerImgEl = document.getElementById("bannerImg");
+  var eventTextEl = document.getElementById("eventText");
   var offlineEl = document.getElementById("offline");
   var missedPolls = 0;
   var currentImageVersion = -1;
+  var eventHideTimer = null;
 
   function pad2(n) { return (n < 10 ? "0" : "") + n; }
 
@@ -132,6 +152,7 @@ OVERLAY_HTML = """<!doctype html>
     counterLabelEl.textContent = state.counter_label || "Матов:";
     counterLabelEl.style.color = state.counter_label_color || "#cfcfcf";
     counterValueEl.style.color = state.counter_value_color || "#ff5b5b";
+    counterEl.style.fontSize = (state.counter_font_size || 22) + "px";
   }
 
   function applyTimer(state) {
@@ -145,10 +166,10 @@ OVERLAY_HTML = """<!doctype html>
     var fmt = state.timer_format || "Без мата: {time}";
     timerTextEl.textContent = fmt.replace("{time}", formatDuration(elapsed));
     timerTextEl.style.color = state.timer_color || "#cfcfcf";
+    timerEl.style.fontSize = (state.timer_font_size || 16) + "px";
   }
 
   function applyBannerContent(state) {
-    // Баннер - ТОЛЬКО картинка, которую выбрал пользователь. Нет картинки - нет баннера.
     if (state.has_image) {
       if (state.image_version !== currentImageVersion) {
         currentImageVersion = state.image_version;
@@ -161,11 +182,27 @@ OVERLAY_HTML = """<!doctype html>
   }
 
   function showBanner(state) {
-    if (!state.has_image) return; // нечего показывать без картинки
-    bannerEl.classList.remove("show");
-    // форс-рефлоу, чтобы анимацию можно было перезапустить если сработает подряд
-    void bannerEl.offsetWidth;
-    bannerEl.classList.add("show");
+    if (eventHideTimer) {
+      clearTimeout(eventHideTimer);
+      eventHideTimer = null;
+    }
+
+    if (state.event_enabled && state.event_word) {
+      var start = (state.event_start_sec || 0).toFixed(2);
+      var end = (state.event_end_sec || 0).toFixed(2);
+      eventTextEl.textContent = "'" + state.event_word + "' [" + start + "s - " + end + "s]";
+      eventTextEl.style.color = state.event_color || "#ffffff";
+      eventTextEl.style.fontSize = (state.event_font_size || 20) + "px";
+      eventTextEl.style.display = "block";
+      var visibleMs = Math.max(600, ((state.event_end_sec || 0) - (state.event_start_sec || 0)) * 1000);
+      eventHideTimer = setTimeout(function () { eventTextEl.style.display = "none"; }, visibleMs);
+    }
+
+    if (state.has_image) {
+      bannerEl.classList.remove("show");
+      void bannerEl.offsetWidth;
+      bannerEl.classList.add("show");
+    }
   }
 
   function pulseCounter() {
@@ -292,9 +329,17 @@ class OverlayServer:
             "counter_label": "Матов:",
             "counter_label_color": "#cfcfcf",
             "counter_value_color": "#ff5b5b",
+            "counter_font_size": 22,
             "timer_enabled": True,
             "timer_format": "Без мата: {time}",
             "timer_color": "#cfcfcf",
+            "timer_font_size": 16,
+            "event_enabled": True,
+            "event_color": "#ffffff",
+            "event_font_size": 20,
+            "event_word": None,
+            "event_start_sec": None,
+            "event_end_sec": None,
             "start_epoch": time.time(),
             "last_swear_epoch": None,
             "has_image": False,
@@ -326,10 +371,13 @@ class OverlayServer:
             if delay_sec is not None:
                 self.state["delay_sec"] = delay_sec
 
-    def notify_censor_event(self, word=None, ts=None):
+    def notify_censor_event(self, word=None, start_sec=None, end_sec=None):
         with self.state_lock:
             self.state["last_swear_epoch"] = time.time()
             self.state["last_event_id"] = self.state.get("last_event_id", 0) + 1
+            self.state["event_word"] = word
+            self.state["event_start_sec"] = start_sec
+            self.state["event_end_sec"] = end_sec
 
     def set_counter_label(self, text):
         text = (text or "").strip() or "Матов:"
@@ -343,6 +391,10 @@ class OverlayServer:
             if value_color and _looks_like_hex_color(value_color):
                 self.state["counter_value_color"] = value_color
 
+    def set_counter_font_size(self, px):
+        with self.state_lock:
+            self.state["counter_font_size"] = max(8, min(200, int(px)))
+
     def set_timer_enabled(self, enabled):
         with self.state_lock:
             self.state["timer_enabled"] = bool(enabled)
@@ -350,7 +402,7 @@ class OverlayServer:
     def set_timer_format(self, text):
         text = (text or "").strip() or "Без мата: {time}"
         if "{time}" not in text:
-            text = text + " {time}"  
+            text = text + " {time}"
         with self.state_lock:
             self.state["timer_format"] = text
 
@@ -358,6 +410,23 @@ class OverlayServer:
         with self.state_lock:
             if color_hex and _looks_like_hex_color(color_hex):
                 self.state["timer_color"] = color_hex
+
+    def set_timer_font_size(self, px):
+        with self.state_lock:
+            self.state["timer_font_size"] = max(8, min(200, int(px)))
+
+    def set_event_enabled(self, enabled):
+        with self.state_lock:
+            self.state["event_enabled"] = bool(enabled)
+
+    def set_event_color(self, color_hex):
+        with self.state_lock:
+            if color_hex and _looks_like_hex_color(color_hex):
+                self.state["event_color"] = color_hex
+
+    def set_event_font_size(self, px):
+        with self.state_lock:
+            self.state["event_font_size"] = max(8, min(200, int(px)))
 
     def set_banner_image(self, path):
         """Загружает картинку с диска и отдаёт её дальше как /banner-image.

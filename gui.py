@@ -121,9 +121,14 @@ class App:
                 label_color=self.saved.get("obs_counter_label_color", "#cfcfcf"),
                 value_color=self.saved.get("obs_counter_value_color", "#ff5b5b"),
             )
+            self.overlay_server.set_counter_font_size(self.saved.get("obs_counter_font_size", 22))
             self.overlay_server.set_timer_enabled(self.saved.get("obs_timer_enabled", True))
             self.overlay_server.set_timer_format(self.saved.get("obs_timer_format", "Без мата: {time}"))
             self.overlay_server.set_timer_color(self.saved.get("obs_timer_color", "#cfcfcf"))
+            self.overlay_server.set_timer_font_size(self.saved.get("obs_timer_font_size", 16))
+            self.overlay_server.set_event_enabled(self.saved.get("obs_event_enabled", True))
+            self.overlay_server.set_event_color(self.saved.get("obs_event_color", "#ffffff"))
+            self.overlay_server.set_event_font_size(self.saved.get("obs_event_font_size", 20))
             saved_banner_image = self.saved.get("obs_banner_image_path")
             if saved_banner_image and os.path.isfile(saved_banner_image):
                 try:
@@ -183,7 +188,7 @@ class App:
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        main_tab = inner  # весь дальнейший код метода пакует виджеты внутрь прокручиваемого фрейма
+        main_tab = inner
 
         frame = ttk.Frame(main_tab)
         frame.pack(fill="x", **pad)
@@ -386,35 +391,70 @@ class App:
         self.overlay_counter_value_color_swatch.grid(row=5, column=1, sticky="w", pady=(4, 0))
         ttk.Button(overlay_frame, text="Выбрать цвет...", command=self._choose_counter_value_color).grid(row=5, column=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(overlay_frame, text="— Таймер «без мата» —", foreground="gray").grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Label(overlay_frame, text="Размер шрифта:").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        self.overlay_counter_font_size_var = tk.IntVar(value=self.saved.get("obs_counter_font_size", 22))
+        counter_font_spin = ttk.Spinbox(overlay_frame, from_=8, to=200, width=6, textvariable=self.overlay_counter_font_size_var, command=self._on_counter_font_size_changed)
+        counter_font_spin.grid(row=6, column=1, sticky="w", pady=(4, 0))
+        counter_font_spin.bind("<Return>", lambda e: self._on_counter_font_size_changed())
+        counter_font_spin.bind("<FocusOut>", lambda e: self._on_counter_font_size_changed())
+
+        ttk.Label(overlay_frame, text="— Таймер «без мата» —", foreground="gray").grid(row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         self.overlay_timer_enabled_var = tk.BooleanVar(value=self.saved.get("obs_timer_enabled", True))
-        ttk.Checkbutton(overlay_frame, text="Показывать таймер", variable=self.overlay_timer_enabled_var, command=self._on_timer_enabled_toggle).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(overlay_frame, text="Показывать таймер", variable=self.overlay_timer_enabled_var, command=self._on_timer_enabled_toggle).grid(row=8, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(overlay_frame, text="Формат таймера:").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(overlay_frame, text="Формат таймера:").grid(row=9, column=0, sticky="w", pady=(4, 0))
         self.overlay_timer_format_var = tk.StringVar(value=self.saved.get("obs_timer_format", "Без мата: {time}"))
         self.overlay_timer_format_var.trace_add("write", self._on_timer_format_changed)
-        ttk.Entry(overlay_frame, textvariable=self.overlay_timer_format_var, width=28).grid(row=8, column=1, sticky="w", pady=(4, 0))
+        ttk.Entry(overlay_frame, textvariable=self.overlay_timer_format_var, width=28).grid(row=9, column=1, sticky="w", pady=(4, 0))
         timer_format_icon = tk.Label(overlay_frame, text="\u2753", fg="gray", cursor="question_arrow")
-        timer_format_icon.grid(row=8, column=2, sticky="w", padx=(4, 0))
+        timer_format_icon.grid(row=9, column=2, sticky="w", padx=(4, 0))
         Tooltip(timer_format_icon, "{time} подставится как ЧЧ:ММ:СС (или 'Xд ЧЧ:ММ:СС' если больше суток).\nОтсчёт идёт от последнего запиканного мата (или от запуска, если мата ещё не было).")
 
-        ttk.Label(overlay_frame, text="Цвет таймера:").grid(row=9, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(overlay_frame, text="Цвет таймера:").grid(row=10, column=0, sticky="w", pady=(4, 0))
         self.overlay_timer_color_var = tk.StringVar(value=self.saved.get("obs_timer_color", "#cfcfcf"))
         self.overlay_timer_color_swatch = tk.Label(overlay_frame, text="  ", background=self.overlay_timer_color_var.get(), relief="sunken", width=4)
-        self.overlay_timer_color_swatch.grid(row=9, column=1, sticky="w", pady=(4, 0))
-        ttk.Button(overlay_frame, text="Выбрать цвет...", command=self._choose_timer_color).grid(row=9, column=2, sticky="w", pady=(4, 0))
+        self.overlay_timer_color_swatch.grid(row=10, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(overlay_frame, text="Выбрать цвет...", command=self._choose_timer_color).grid(row=10, column=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(overlay_frame, text="— Баннер при мате —", foreground="gray").grid(row=10, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Label(overlay_frame, text="Размер шрифта:").grid(row=11, column=0, sticky="w", pady=(4, 0))
+        self.overlay_timer_font_size_var = tk.IntVar(value=self.saved.get("obs_timer_font_size", 16))
+        timer_font_spin = ttk.Spinbox(overlay_frame, from_=8, to=200, width=6, textvariable=self.overlay_timer_font_size_var, command=self._on_timer_font_size_changed)
+        timer_font_spin.grid(row=11, column=1, sticky="w", pady=(4, 0))
+        timer_font_spin.bind("<Return>", lambda e: self._on_timer_font_size_changed())
+        timer_font_spin.bind("<FocusOut>", lambda e: self._on_timer_font_size_changed())
 
-        ttk.Label(overlay_frame, text="Картинка баннера:").grid(row=11, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(overlay_frame, text="— Текст события (слово + тайм-код при бипе) —", foreground="gray").grid(row=12, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        self.overlay_event_enabled_var = tk.BooleanVar(value=self.saved.get("obs_event_enabled", True))
+        ttk.Checkbutton(overlay_frame, text="Показывать текст события", variable=self.overlay_event_enabled_var, command=self._on_event_enabled_toggle).grid(row=13, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        event_enabled_icon = tk.Label(overlay_frame, text="\u2753", fg="gray", cursor="question_arrow")
+        event_enabled_icon.grid(row=13, column=2, sticky="w", padx=(4, 0))
+        Tooltip(event_enabled_icon, "Появляется наверху экрана в момент, когда играет бип, в формате \"слово\" [начало-конец].\nПоказ синхронизирован с реальной задержкой звука, а не с моментом распознавания.")
+
+        ttk.Label(overlay_frame, text="Цвет текста события:").grid(row=14, column=0, sticky="w", pady=(4, 0))
+        self.overlay_event_color_var = tk.StringVar(value=self.saved.get("obs_event_color", "#ffffff"))
+        self.overlay_event_color_swatch = tk.Label(overlay_frame, text="  ", background=self.overlay_event_color_var.get(), relief="sunken", width=4)
+        self.overlay_event_color_swatch.grid(row=14, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(overlay_frame, text="Выбрать цвет...", command=self._choose_event_color).grid(row=14, column=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(overlay_frame, text="Размер шрифта:").grid(row=15, column=0, sticky="w", pady=(4, 0))
+        self.overlay_event_font_size_var = tk.IntVar(value=self.saved.get("obs_event_font_size", 20))
+        event_font_spin = ttk.Spinbox(overlay_frame, from_=8, to=200, width=6, textvariable=self.overlay_event_font_size_var, command=self._on_event_font_size_changed)
+        event_font_spin.grid(row=15, column=1, sticky="w", pady=(4, 0))
+        event_font_spin.bind("<Return>", lambda e: self._on_event_font_size_changed())
+        event_font_spin.bind("<FocusOut>", lambda e: self._on_event_font_size_changed())
+
+        ttk.Label(overlay_frame, text="— Баннер при мате —", foreground="gray").grid(row=16, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        ttk.Label(overlay_frame, text="Картинка баннера:").grid(row=17, column=0, sticky="w", pady=(4, 0))
         self.overlay_banner_image_var = tk.StringVar(value=self.saved.get("obs_banner_image_path") or "(не выбрана — баннер не показывается)")
-        ttk.Entry(overlay_frame, textvariable=self.overlay_banner_image_var, width=42, state="readonly").grid(row=11, column=1, columnspan=2, sticky="we", pady=(4, 0))
-        ttk.Button(overlay_frame, text="Выбрать картинку...", command=self._choose_banner_image).grid(row=12, column=1, sticky="w", pady=(2, 0))
-        ttk.Button(overlay_frame, text="Сбросить", command=self._reset_banner_image).grid(row=12, column=2, sticky="w", pady=(2, 0))
-        ttk.Button(overlay_frame, text="Показать тест баннера", command=self._test_banner).grid(row=12, column=3, sticky="w", pady=(2, 0))
+        ttk.Entry(overlay_frame, textvariable=self.overlay_banner_image_var, width=42, state="readonly").grid(row=17, column=1, columnspan=2, sticky="we", pady=(4, 0))
+        ttk.Button(overlay_frame, text="Выбрать картинку...", command=self._choose_banner_image).grid(row=18, column=1, sticky="w", pady=(2, 0))
+        ttk.Button(overlay_frame, text="Сбросить", command=self._reset_banner_image).grid(row=18, column=2, sticky="w", pady=(2, 0))
+        ttk.Button(overlay_frame, text="Показать тест баннера", command=self._test_banner).grid(row=18, column=3, sticky="w", pady=(2, 0))
         banner_info_icon = tk.Label(overlay_frame, text="\u2753", fg="gray", cursor="question_arrow")
-        banner_info_icon.grid(row=12, column=4, sticky="w", padx=(6, 0))
+        banner_info_icon.grid(row=18, column=4, sticky="w", padx=(6, 0))
         Tooltip(
             banner_info_icon,
             "Баннер при мате - это картинка или гифка, которую ты сам выбираешь.\n"
@@ -789,6 +829,15 @@ class App:
             self.overlay_server.set_counter_colors(value_color=hex_color)
         self._autosave()
 
+    def _on_counter_font_size_changed(self):
+        try:
+            px = int(self.overlay_counter_font_size_var.get())
+        except (tk.TclError, ValueError):
+            return
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_counter_font_size(px)
+        self._autosave()
+
     def _on_timer_enabled_toggle(self):
         if getattr(self, "overlay_server", None):
             self.overlay_server.set_timer_enabled(self.overlay_timer_enabled_var.get())
@@ -809,6 +858,41 @@ class App:
         self.overlay_timer_color_swatch.config(background=hex_color)
         if getattr(self, "overlay_server", None):
             self.overlay_server.set_timer_color(hex_color)
+        self._autosave()
+
+    def _on_timer_font_size_changed(self):
+        try:
+            px = int(self.overlay_timer_font_size_var.get())
+        except (tk.TclError, ValueError):
+            return
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_timer_font_size(px)
+        self._autosave()
+
+    def _on_event_enabled_toggle(self):
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_event_enabled(self.overlay_event_enabled_var.get())
+        self._autosave()
+
+    def _choose_event_color(self):
+        _, hex_color = colorchooser.askcolor(
+            color=self.overlay_event_color_var.get(), title="Цвет текста события",
+        )
+        if not hex_color:
+            return
+        self.overlay_event_color_var.set(hex_color)
+        self.overlay_event_color_swatch.config(background=hex_color)
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_event_color(hex_color)
+        self._autosave()
+
+    def _on_event_font_size_changed(self):
+        try:
+            px = int(self.overlay_event_font_size_var.get())
+        except (tk.TclError, ValueError):
+            return
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.set_event_font_size(px)
         self._autosave()
 
     def _choose_banner_image(self):
@@ -839,7 +923,7 @@ class App:
         if not self.overlay_server.get_state().get("has_image"):
             messagebox.showinfo("Инфо", "Сначала выбери картинку баннера кнопкой 'Выбрать картинку...' — иначе показывать нечего.")
             return
-        self.overlay_server.notify_censor_event()
+        self.overlay_server.notify_censor_event("тест", 53.76, 54.18)
         self._log("Тестовый показ баннера отправлен на оверлей — глянь в OBS/браузере, где он появился.")
 
     def _check_updates_on_startup(self):
@@ -1183,7 +1267,7 @@ class App:
         if config is None:
             return
 
-        self.mic_test_engine = SwearBeeperEngine(config, self._log, journal_callback=self._on_swear_journal, crash_callback=self._on_engine_crash)
+        self.mic_test_engine = SwearBeeperEngine(config, self._log, journal_callback=self._on_swear_journal, crash_callback=self._on_engine_crash, event_callback=self._on_censor_playback_event)
         try:
             self.mic_test_engine.start()
         except Exception as e:
@@ -1233,7 +1317,10 @@ class App:
                 })
             if getattr(self, "overlay_server", None):
                 self.overlay_server.update_snapshot(session_total, alltime_total)
-                self.overlay_server.notify_censor_event(word, timestamp)
+
+    def _on_censor_playback_event(self, word, start_sec, end_sec):
+        if getattr(self, "overlay_server", None):
+            self.overlay_server.notify_censor_event(word, start_sec, end_sec)
 
     def _log(self, message):
         self.log_queue.put(message)
@@ -1352,9 +1439,14 @@ class App:
             "obs_counter_label": self.overlay_counter_label_var.get() if hasattr(self, "overlay_counter_label_var") else "Матов:",
             "obs_counter_label_color": self.overlay_counter_label_color_var.get() if hasattr(self, "overlay_counter_label_color_var") else "#cfcfcf",
             "obs_counter_value_color": self.overlay_counter_value_color_var.get() if hasattr(self, "overlay_counter_value_color_var") else "#ff5b5b",
+            "obs_counter_font_size": self.overlay_counter_font_size_var.get() if hasattr(self, "overlay_counter_font_size_var") else 22,
             "obs_timer_enabled": self.overlay_timer_enabled_var.get() if hasattr(self, "overlay_timer_enabled_var") else True,
             "obs_timer_format": self.overlay_timer_format_var.get() if hasattr(self, "overlay_timer_format_var") else "Без мата: {time}",
             "obs_timer_color": self.overlay_timer_color_var.get() if hasattr(self, "overlay_timer_color_var") else "#cfcfcf",
+            "obs_timer_font_size": self.overlay_timer_font_size_var.get() if hasattr(self, "overlay_timer_font_size_var") else 16,
+            "obs_event_enabled": self.overlay_event_enabled_var.get() if hasattr(self, "overlay_event_enabled_var") else True,
+            "obs_event_color": self.overlay_event_color_var.get() if hasattr(self, "overlay_event_color_var") else "#ffffff",
+            "obs_event_font_size": self.overlay_event_font_size_var.get() if hasattr(self, "overlay_event_font_size_var") else 20,
             "obs_banner_image_path": (
                 self.overlay_banner_image_var.get()
                 if hasattr(self, "overlay_banner_image_var") and os.path.isfile(self.overlay_banner_image_var.get())
@@ -1729,7 +1821,7 @@ class App:
         if config is None:
             return
 
-        self.engine = SwearBeeperEngine(config, self._log, journal_callback=self._on_swear_journal, crash_callback=self._on_engine_crash)
+        self.engine = SwearBeeperEngine(config, self._log, journal_callback=self._on_swear_journal, crash_callback=self._on_engine_crash, event_callback=self._on_censor_playback_event)
 
         def run_engine():
             try:
